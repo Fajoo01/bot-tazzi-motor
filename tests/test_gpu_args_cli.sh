@@ -44,6 +44,7 @@ for i in "${!BINS[@]}"; do
     "$bin" --help > "$LOG" 2>&1 || true
     if grep -q -- "--rocm" "$LOG"; then
         assert_grep "$name --help mentions --rocm" "--rocm" "$LOG"
+    assert_grep "$name --help mentions --cuda-low-vram-stream" "cuda-low-vram-stream" "$LOG"
         assert_not_grep "$name ROCm help omits --cuda-tensor-parallel" \
             "--cuda-tensor-parallel" "$LOG"
     else
@@ -196,6 +197,17 @@ for i in 0 1 3; do
         fail "$name retained provisional --dspark-exact-sampling"
     fi
 done
+
+if [ -x ./ds4 ]; then
+    ./ds4 --cuda-low-vram-stream -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       grep -q -- "--cuda-low-vram-stream requires --cuda and --ssd-streaming" "$LOG"; then
+        ok "cuda-low-vram-stream rejects missing CUDA SSD mode"
+    else
+        fail "cuda-low-vram-stream missing prerequisite validation"
+    fi
+fi
 
 # 2: parser error on syntactically invalid value. For ds4-bench, we
 # also pass --prompt-file /dev/null so it doesn't exit on the

@@ -78,7 +78,6 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
-#ifdef __APPLE__
 /* V4.1 activation/cache formats. Buffers are float-addressable but the
  * rounded values follow the released BF16/FP8/FP4 inference graph. */
 typedef enum {
@@ -258,7 +257,6 @@ int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
-#endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
@@ -329,6 +327,7 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
+void ds4_gpu_set_cuda_low_vram_stream(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);

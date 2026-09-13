@@ -2063,6 +2063,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
+        } else if (!strcmp(arg, "--cuda-low-vram-stream")) {
+            c.engine.cuda_low_vram_stream = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {

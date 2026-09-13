@@ -157,6 +157,7 @@ typedef struct {
     bool dspark_confidence_threshold_set;
     bool cuda_tensor_parallel;
     bool ssd_streaming;
+    bool cuda_low_vram_stream;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     bool inspect_only;
