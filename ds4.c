@@ -1,3 +1,4 @@
+#include ".ced-validation/ced-profile.h"
 /* =========================================================================
  * ds4.c - DeepSeek V4 inference engine.
  * =========================================================================
@@ -39587,6 +39588,7 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il) {
+    CED_RANGE("publish layer=%u pos=%u", il, g->pos);
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -39662,6 +39664,7 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
+    CED_RANGE("attention layer=%u pos=%u", il, g->pos);
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -39697,6 +39700,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
+    CED_RANGE("moe layer=%u pos=%u", il, g->pos);
     uint64_t gate_row = 0, down_row = 0;
     if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
         !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
@@ -39770,6 +39774,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
+    CED_RANGE("head pos=%u", g->pos);
     if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
     bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
               ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
@@ -39781,6 +39786,7 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
+    CED_RANGE("before_attention layer=%u pos=%u", il, g->pos);
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
         if (!ds41_matmul(g->engram_kv, m, l->engram_kv, g->engram_rows, true) ||
@@ -39837,6 +39843,7 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
                                          uint32_t il, uint32_t count) {
+    CED_RANGE("before_attention_batch layer=%u pos=%u rows=%u", il, g->pos, count);
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
         if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
@@ -39894,6 +39901,7 @@ static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
 static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
                                          uint32_t il, uint32_t start, uint32_t count) {
+    CED_RANGE("publish_batch layer=%u pos=%u rows=%u", il, start, count);
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t first = start / ratio, rows = (start + count) / ratio - first;
@@ -39991,6 +39999,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il, uint32_t count) {
+    CED_RANGE("attention_batch layer=%u pos=%u rows=%u", il, g->pos, count);
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (start + count) / ratio : 0;
@@ -40080,6 +40089,7 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
+    CED_RANGE("layer=%u pos=%u", il, g->pos);
     return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
         ds41_graph_after_moe(g);
 }
@@ -40122,6 +40132,7 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner) {
+    CED_RANGE("moe_batch layer=%u pos=%u rows=%u", il, g->pos, count);
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
@@ -40169,6 +40180,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
+    CED_RANGE("step pos=%u", g->pos);
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
@@ -40408,6 +40420,7 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
                                   uint32_t initial_start, uint32_t offset, uint32_t rows,
                                   bool publish, bool split_pre, bool batch_attention,
                                   ds4_session_cancel_fn cancel, void *cancel_ud) {
+    CED_RANGE("decoder_prepare layer=%u rows=%u publish=%u", il, rows, publish);
     ds41_gpu_graph row = *g;
     bool ok = true;
     const bool batch_publish = publish && batch_attention &&
@@ -40543,6 +40556,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
                               bool encoder_only, bool resume_encoder) {
+    CED_RANGE("prefill pos=%u rows=%u", g->pos, total_count);
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
     const bool wide = total_count > encoder_chunk;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
@@ -40586,6 +40600,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
     metal_graph_stream_prepare_slot prepare = {0};
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        CED_RANGE("prefill_layer=%u pos=%u rows=%u", il, g->pos, total_count);
         if (cancel && cancel(cancel_ud)) { ok = false; break; }
         if (encoder_only && il == 20u) {
             /* Publish every encoder key, but leave the decoder invalid until
