@@ -551,6 +551,7 @@ static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
+static uint64_t g_model_stage_next;
 static char *g_low_vram_stage_device;
 typedef struct {
     const void *host_base;
@@ -2200,6 +2201,7 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_model_stage_bytes = 0;
+    g_model_stage_next = 0;
     if (!g_model_upload_stream) {
         cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
         if (err != cudaSuccess) {
@@ -3319,10 +3321,13 @@ static const char *cuda_low_vram_stage_range(
     if (!cuda_model_stage_pool_alloc(host_stage_bytes)) return NULL;
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
+    const int async_stage = getenv("DS4_CUDA_LOW_VRAM_ASYNC_STAGE") != NULL;
+    uint64_t last_bi = 0;
     while (copied < bytes) {
         const uint64_t n = bytes - copied < chunk ? bytes - copied : chunk;
-        const uint64_t bi = chunk_idx % 4u;
-        if (chunk_idx >= 4u) {
+        const uint64_t seq = async_stage ? g_model_stage_next++ : chunk_idx;
+        const uint64_t bi = seq % 4u;
+        if (seq >= 4u) {
             cudaError_t wait_err = cudaEventSynchronize(g_model_stage_event[bi]);
             if (wait_err != cudaSuccess) {
                 fprintf(stderr,
@@ -3332,6 +3337,7 @@ static const char *cuda_low_vram_stage_range(
                 return NULL;
             }
         }
+        last_bi = bi;
         const char *payload = NULL;
         if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
                                    offset + copied, n, &payload)) {
@@ -3361,9 +3367,11 @@ static const char *cuda_low_vram_stage_range(
         copied += n;
         chunk_idx++;
     }
-    cudaError_t sync_err = cudaStreamSynchronize(g_model_upload_stream);
+    cudaError_t sync_err = async_stage && chunk_idx != 0
+        ? cudaStreamWaitEvent(cuda_decode_stream(), g_model_stage_event[last_bi], 0)
+        : cudaStreamSynchronize(g_model_upload_stream);
     if (sync_err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA low-VRAM upload sync failed for %s: %s\n",
+        fprintf(stderr, "ds4: CUDA low-VRAM upload dependency failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(sync_err));
         (void)cudaGetLastError();
         return NULL;
@@ -3924,6 +3932,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
     }
     g_model_stage_bytes = 0;
+    g_model_stage_next = 0;
     if (g_model_upload_stream) {
         (void)cudaStreamDestroy(g_model_upload_stream);
         g_model_upload_stream = NULL;
