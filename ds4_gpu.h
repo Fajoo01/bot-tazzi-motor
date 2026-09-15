@@ -328,6 +328,9 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_cuda_low_vram_stream(bool enabled);
+void ds4_gpu_low_vram_dense_layer_begin(uint32_t layer);
+void ds4_gpu_low_vram_dense_prefetch_next_early(uint32_t layer);
+void ds4_gpu_low_vram_dense_prefetch_next(uint32_t layer);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);

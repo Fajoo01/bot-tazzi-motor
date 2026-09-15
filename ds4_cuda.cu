@@ -17,6 +17,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -231,6 +233,227 @@ static int cuda_stream_selected_cache_uses_persistent_weights(void) {
            cache->gate_ptr && cache->up_ptr && cache->down_ptr;
 }
 
+struct cuda_expert_host_chunk_entry {
+    uint64_t offset;
+    uint64_t bytes;
+    char *data;
+    uint64_t last_used;
+    int valid;
+};
+static std::vector<cuda_expert_host_chunk_entry> g_expert_host_chunks;
+static std::unordered_map<uint64_t, size_t> g_expert_host_chunk_by_offset;
+static pthread_mutex_t g_expert_host_chunk_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_expert_host_chunk_used;
+static uint64_t g_expert_host_chunk_tick;
+static uint64_t g_expert_host_chunk_hits;
+static uint64_t g_expert_host_chunk_misses;
+static uint64_t g_expert_host_chunk_served;
+static uint64_t g_expert_host_chunk_filled;
+static uint64_t g_expert_host_chunk_evictions;
+static char *g_expert_host_chunk_pinned_arena;
+static uint64_t g_expert_host_chunk_pinned_capacity;
+static int g_expert_host_chunk_pinned_failed;
+
+static uint64_t cuda_expert_host_chunk_budget_bytes(void) {
+    static uint64_t budget = UINT64_MAX;
+    if (budget != UINT64_MAX) return budget;
+    budget = 0;
+    const char *env = getenv("DS4_CUDA_HOST_EXPERT_CHUNK_CACHE_GB");
+    if (!env || !env[0] || !strcmp(env, "0")) return 0;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long gib = strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || gib == 0 || gib > 32u) {
+        fprintf(stderr,
+                "ds4: ignoring invalid DS4_CUDA_HOST_EXPERT_CHUNK_CACHE_GB=\"%s\" (want 1..32)\n",
+                env);
+        return 0;
+    }
+    budget = (uint64_t)gib << 30;
+    fprintf(stderr, "ds4: CUDA expert host chunk cache budget %.2f GiB (pageable RAM)\n",
+            (double)budget / 1073741824.0);
+    return budget;
+}
+
+static int cuda_expert_host_chunk_pinned_enabled(void) {
+    const char *env = getenv("DS4_CUDA_HOST_EXPERT_CHUNK_CACHE_PINNED");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static int cuda_expert_host_chunk_enabled_for_call(void) { return 1; }
+
+static int cuda_expert_host_chunk_pinned_ensure(uint64_t budget) {
+    if (!cuda_expert_host_chunk_pinned_enabled() || g_expert_host_chunk_pinned_failed)
+        return 0;
+    if (g_expert_host_chunk_pinned_arena) return 1;
+    void *arena = NULL;
+    const cudaError_t err = cudaMallocHost(&arena, (size_t)budget);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA expert host pinned arena unavailable (%.2f GiB): %s; using pageable cache\n",
+                (double)budget / 1073741824.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        g_expert_host_chunk_pinned_failed = 1;
+        return 0;
+    }
+    g_expert_host_chunk_pinned_arena = (char *)arena;
+    g_expert_host_chunk_pinned_capacity = budget;
+    fprintf(stderr, "ds4: CUDA expert host chunk cache pinned arena %.2f GiB\n",
+            (double)budget / 1073741824.0);
+    return 1;
+}
+
+static const char *cuda_expert_host_chunk_ptr(uint64_t offset, uint64_t bytes) {
+    if (!cuda_expert_host_chunk_enabled_for_call() || bytes == 0 ||
+        cuda_expert_host_chunk_budget_bytes() == 0 ||
+        !g_expert_host_chunk_pinned_arena) return NULL;
+    const char *ptr = NULL;
+    pthread_mutex_lock(&g_expert_host_chunk_mu);
+    auto it = g_expert_host_chunk_by_offset.find(offset);
+    if (it != g_expert_host_chunk_by_offset.end()) {
+        cuda_expert_host_chunk_entry &e = g_expert_host_chunks[it->second];
+        if (e.valid && e.bytes == bytes && e.data) {
+            ptr = e.data;
+            e.last_used = ++g_expert_host_chunk_tick;
+            g_expert_host_chunk_hits++;
+            g_expert_host_chunk_served += bytes;
+        }
+    }
+    if (!ptr) g_expert_host_chunk_misses++;
+    pthread_mutex_unlock(&g_expert_host_chunk_mu);
+    return ptr;
+}
+
+static int cuda_expert_host_chunk_copy(void *dst, uint64_t offset, uint64_t bytes) {
+    if (!dst || !cuda_expert_host_chunk_enabled_for_call() || bytes == 0 ||
+        cuda_expert_host_chunk_budget_bytes() == 0) return 0;
+    int hit = 0;
+    pthread_mutex_lock(&g_expert_host_chunk_mu);
+    auto it = g_expert_host_chunk_by_offset.find(offset);
+    if (it != g_expert_host_chunk_by_offset.end()) {
+        cuda_expert_host_chunk_entry &e = g_expert_host_chunks[it->second];
+        if (e.valid && e.bytes == bytes && e.data) {
+            memcpy(dst, e.data, (size_t)bytes);
+            e.last_used = ++g_expert_host_chunk_tick;
+            g_expert_host_chunk_hits++;
+            g_expert_host_chunk_served += bytes;
+            hit = 1;
+        }
+    }
+    if (!hit) g_expert_host_chunk_misses++;
+    pthread_mutex_unlock(&g_expert_host_chunk_mu);
+    return hit;
+}
+
+static void cuda_expert_host_chunk_store(uint64_t offset, uint64_t bytes,
+                                         const void *src) {
+    const uint64_t budget = cuda_expert_host_chunk_budget_bytes();
+    if (!src || !cuda_expert_host_chunk_enabled_for_call() ||
+        bytes == 0 || budget == 0 || bytes > budget) return;
+    pthread_mutex_lock(&g_expert_host_chunk_mu);
+    auto existing = g_expert_host_chunk_by_offset.find(offset);
+    if (existing != g_expert_host_chunk_by_offset.end()) {
+        cuda_expert_host_chunk_entry &e = g_expert_host_chunks[existing->second];
+        if (e.valid && e.bytes == bytes) {
+            e.last_used = ++g_expert_host_chunk_tick;
+            pthread_mutex_unlock(&g_expert_host_chunk_mu);
+            return;
+        }
+    }
+    while (!g_expert_host_chunk_pinned_arena &&
+           (g_expert_host_chunk_used > budget || bytes > budget - g_expert_host_chunk_used)) {
+        size_t victim = SIZE_MAX;
+        uint64_t oldest = UINT64_MAX;
+        for (size_t i = 0; i < g_expert_host_chunks.size(); i++) {
+            const cuda_expert_host_chunk_entry &e = g_expert_host_chunks[i];
+            if (e.valid && e.last_used < oldest) { oldest = e.last_used; victim = i; }
+        }
+        if (victim == SIZE_MAX) break;
+        cuda_expert_host_chunk_entry &e = g_expert_host_chunks[victim];
+        g_expert_host_chunk_by_offset.erase(e.offset);
+        g_expert_host_chunk_used -= e.bytes;
+        if (!g_expert_host_chunk_pinned_arena) free(e.data);
+        e = {};
+        g_expert_host_chunk_evictions++;
+    }
+    if (g_expert_host_chunk_used > budget || bytes > budget - g_expert_host_chunk_used) {
+        pthread_mutex_unlock(&g_expert_host_chunk_mu);
+        return;
+    }
+    const int use_pinned = cuda_expert_host_chunk_pinned_enabled() &&
+        cuda_expert_host_chunk_pinned_ensure(budget);
+    char *data = NULL;
+    if (use_pinned) {
+        if (g_expert_host_chunk_used > g_expert_host_chunk_pinned_capacity ||
+            bytes > g_expert_host_chunk_pinned_capacity - g_expert_host_chunk_used) {
+            pthread_mutex_unlock(&g_expert_host_chunk_mu);
+            return;
+        }
+        data = g_expert_host_chunk_pinned_arena + g_expert_host_chunk_used;
+    } else {
+        data = (char *)malloc((size_t)bytes);
+    }
+    if (!data) { pthread_mutex_unlock(&g_expert_host_chunk_mu); return; }
+    memcpy(data, src, (size_t)bytes);
+    size_t slot = SIZE_MAX;
+    for (size_t i = 0; i < g_expert_host_chunks.size(); i++) {
+        if (!g_expert_host_chunks[i].valid) { slot = i; break; }
+    }
+    try {
+        if (slot == SIZE_MAX) {
+            slot = g_expert_host_chunks.size();
+            g_expert_host_chunks.push_back({offset, bytes, data, ++g_expert_host_chunk_tick, 1});
+        } else {
+            g_expert_host_chunks[slot] = {offset, bytes, data, ++g_expert_host_chunk_tick, 1};
+        }
+        g_expert_host_chunk_by_offset[offset] = slot;
+    } catch (...) {
+        if (slot < g_expert_host_chunks.size() &&
+            g_expert_host_chunks[slot].data == data) g_expert_host_chunks[slot] = {};
+        if (!use_pinned) free(data);
+        pthread_mutex_unlock(&g_expert_host_chunk_mu);
+        return;
+    }
+    g_expert_host_chunk_used += bytes;
+    g_expert_host_chunk_filled += bytes;
+    pthread_mutex_unlock(&g_expert_host_chunk_mu);
+}
+
+static void cuda_expert_host_chunk_release(void) {
+    pthread_mutex_lock(&g_expert_host_chunk_mu);
+    if (g_expert_host_chunk_hits || g_expert_host_chunk_misses) {
+        const uint64_t lookups = g_expert_host_chunk_hits + g_expert_host_chunk_misses;
+        fprintf(stderr,
+                "ds4: CUDA expert host chunk cache summary: resident=%.2f GiB hits=%llu misses=%llu hit-rate=%.1f%% served=%.2f GiB filled=%.2f GiB evictions=%llu\n",
+                (double)g_expert_host_chunk_used / 1073741824.0,
+                (unsigned long long)g_expert_host_chunk_hits,
+                (unsigned long long)g_expert_host_chunk_misses,
+                lookups ? 100.0 * (double)g_expert_host_chunk_hits / (double)lookups : 0.0,
+                (double)g_expert_host_chunk_served / 1073741824.0,
+                (double)g_expert_host_chunk_filled / 1073741824.0,
+                (unsigned long long)g_expert_host_chunk_evictions);
+    }
+    if (g_expert_host_chunk_pinned_arena) {
+        (void)cudaFreeHost(g_expert_host_chunk_pinned_arena);
+        g_expert_host_chunk_pinned_arena = NULL;
+        g_expert_host_chunk_pinned_capacity = 0;
+    } else {
+        for (cuda_expert_host_chunk_entry &e : g_expert_host_chunks)
+            if (e.valid) free(e.data);
+    }
+    g_expert_host_chunk_pinned_failed = 0;
+    g_expert_host_chunks.clear();
+    g_expert_host_chunk_by_offset.clear();
+    g_expert_host_chunk_used = 0;
+    g_expert_host_chunk_tick = 0;
+    g_expert_host_chunk_hits = 0;
+    g_expert_host_chunk_misses = 0;
+    g_expert_host_chunk_served = 0;
+    g_expert_host_chunk_filled = 0;
+    g_expert_host_chunk_evictions = 0;
+    pthread_mutex_unlock(&g_expert_host_chunk_mu);
+}
+
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
 }
@@ -274,6 +497,7 @@ static void cuda_stream_selected_cache_release(void) {
                 (unsigned long long)g_stream_selected_upload_ranges,
                 (double)g_stream_selected_upload_bytes / 1073741824.0);
     }
+    cuda_expert_host_chunk_release();
     cuda_stream_persistent_cache_release();
     if (g_stream_selected_cache.gate_ptr) {
         (void)cudaFree(g_stream_selected_cache.gate_ptr);
@@ -566,8 +790,73 @@ static uint64_t g_low_vram_stage_upload_ranges;
 static uint64_t g_low_vram_stage_hits;
 static uint64_t g_low_vram_stage_reuses;
 static uint64_t g_low_vram_stage_peak_used;
+
+struct cuda_dense_readahead_range {
+    uint64_t source_offset;
+    uint64_t bytes;
+    uint64_t device_offset;
+};
+struct cuda_dense_readahead_plan {
+    std::vector<cuda_dense_readahead_range> ranges;
+    uint64_t packed_bytes = 0;
+    bool ready = false;
+};
+static cuda_dense_readahead_plan g_dense_readahead_plan[128];
+static int32_t g_dense_readahead_layer = -1;
+static int32_t g_dense_readahead_bank = -1;
+static uint64_t g_dense_readahead_window_begin;
+static uint64_t g_dense_readahead_window_end;
+static uint64_t g_dense_readahead_started;
+static uint64_t g_dense_readahead_completed;
+static uint64_t g_dense_readahead_hits;
+static uint64_t g_dense_readahead_skipped_large;
+static uint64_t g_dense_readahead_bytes;
+
+struct cuda_dense_host_cache_entry {
+    uint64_t source_offset;
+    uint64_t bytes;
+    char *data;
+};
+static std::vector<cuda_dense_host_cache_entry> g_dense_host_cache_entries;
+static pthread_mutex_t g_dense_host_cache_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_dense_host_cache_used;
+static uint64_t g_dense_host_cache_hits;
+static uint64_t g_dense_host_cache_misses;
+static uint64_t g_dense_host_cache_hit_bytes;
+static uint64_t g_dense_host_cache_fill_bytes;
+static uint64_t g_dense_host_cache_skipped_bytes;
+static char *g_dense_host_cache_pinned_arena;
+static uint64_t g_dense_host_cache_pinned_capacity;
+static int g_dense_host_cache_pinned_failed;
+
+struct cuda_dense_readahead_prefetch {
+    pthread_t thread = {};
+    bool active = false;
+    bool ok = false;
+    std::atomic<bool> cancel{false};
+    uint32_t layer = 0;
+    uint32_t bank = 0;
+    std::vector<cuda_dense_readahead_range> ranges;
+    int fd = -1;
+    int direct_fd = -1;
+    int device = 0;
+    uint64_t align = 1;
+    uint64_t file_size = 0;
+    uint64_t bytes = 0;
+    char *device_base = NULL;
+    void *stage_raw[2] = {};
+    void *stage[2] = {};
+    uint64_t stage_bytes = 0;
+    cudaStream_t stream = NULL;
+    cudaEvent_t ready[2] = {};
+};
+static cuda_dense_readahead_prefetch g_dense_readahead_prefetch;
+
 static uint64_t cuda_low_vram_stage_budget_bytes(void);
 static uint64_t cuda_low_vram_reserve_budget_bytes(void);
+static int cuda_dense_readahead_enabled(void);
+static int cuda_dense_readahead_finish(int cancel);
+static void cuda_dense_readahead_reset(void);
 static void *g_stream_selected_stage_raw[4];
 static void *g_stream_selected_stage[4];
 static cudaEvent_t g_stream_selected_stage_event[4];
@@ -2244,41 +2533,534 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     return 1;
 }
 
-static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
-                                 uint64_t offset, uint64_t bytes,
-                                 const char **payload) {
+static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
+                                      uint64_t file_size, void *stage,
+                                      uint64_t stage_bytes, uint64_t offset,
+                                      uint64_t bytes, const char **payload) {
     *payload = (const char *)stage;
 #if defined(__linux__) && defined(O_DIRECT)
-    if (g_model_direct_fd >= 0 && g_model_direct_align > 1 && g_model_file_size != 0) {
-        const uint64_t aligned_off = cuda_round_down(offset, g_model_direct_align);
+    if (*direct_fd >= 0 && align > 1 && file_size != 0) {
+        const uint64_t aligned_off = cuda_round_down(offset, align);
         const uint64_t delta = offset - aligned_off;
-        uint64_t read_size = cuda_round_up(delta + bytes, g_model_direct_align);
-        if (aligned_off <= g_model_file_size &&
-            read_size <= stage_bytes &&
-            read_size <= g_model_file_size - aligned_off) {
+        const uint64_t read_size = cuda_round_up(delta + bytes, align);
+        if (aligned_off <= file_size && read_size <= stage_bytes &&
+            read_size <= file_size - aligned_off) {
             const int saved_errno = errno;
             errno = 0;
-            if (cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            if (cuda_pread_full(*direct_fd, stage, read_size, aligned_off)) {
                 *payload = (const char *)stage + delta;
                 errno = saved_errno;
                 return 1;
             }
             const int direct_errno = errno;
-            if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                    fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n", strerror(direct_errno));
-                }
-                (void)close(g_model_direct_fd);
-                g_model_direct_fd = -1;
-                g_model_direct_align = 1;
+            if (direct_errno == EINVAL || direct_errno == EFAULT ||
+                direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
+                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
+                    fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n",
+                            strerror(direct_errno));
+                (void)close(*direct_fd);
+                *direct_fd = -1;
             }
             errno = direct_errno;
         }
     }
 #else
-    (void)stage_bytes;
+    (void)direct_fd; (void)align; (void)file_size; (void)stage_bytes;
 #endif
-    return cuda_pread_full(g_model_fd, stage, bytes, offset);
+    return cuda_pread_full(fd, stage, bytes, offset);
+}
+
+static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
+                                 uint64_t offset, uint64_t bytes,
+                                 const char **payload) {
+    const int ok = cuda_model_stage_read_from(
+        g_model_fd, &g_model_direct_fd, g_model_direct_align, g_model_file_size,
+        stage, stage_bytes, offset, bytes, payload);
+#if defined(__linux__) && defined(O_DIRECT)
+    if (g_model_direct_fd < 0) g_model_direct_align = 1;
+#endif
+    return ok;
+}
+
+static uint64_t cuda_dense_host_cache_budget_bytes(void) {
+    static uint64_t budget = UINT64_MAX;
+    if (budget != UINT64_MAX) return budget;
+    budget = 0;
+    const char *env = getenv("DS4_CUDA_LOW_VRAM_HOST_CACHE_GB");
+    if (!env || !env[0] || !strcmp(env, "0")) return 0;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long gib = strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || gib == 0 || gib > 32u) {
+        fprintf(stderr,
+                "ds4: ignoring invalid DS4_CUDA_LOW_VRAM_HOST_CACHE_GB=\"%s\" (want 1..32)\n",
+                env);
+        return 0;
+    }
+    budget = (uint64_t)gib << 30;
+    fprintf(stderr, "ds4: CUDA dense host cache budget %.2f GiB (pageable RAM)\n",
+            (double)budget / 1073741824.0);
+    return budget;
+}
+
+static int cuda_dense_host_cache_pinned_enabled(void) {
+    const char *env = getenv("DS4_CUDA_LOW_VRAM_HOST_CACHE_PINNED");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static int cuda_dense_host_cache_pinned_ensure(uint64_t budget) {
+    if (!cuda_dense_host_cache_pinned_enabled() || g_dense_host_cache_pinned_failed)
+        return 0;
+    if (g_dense_host_cache_pinned_arena) return 1;
+    void *arena = NULL;
+    const cudaError_t err = cudaMallocHost(&arena, (size_t)budget);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA dense host pinned arena unavailable (%.2f GiB): %s; using pageable cache\n",
+                (double)budget / 1073741824.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        g_dense_host_cache_pinned_failed = 1;
+        return 0;
+    }
+    g_dense_host_cache_pinned_arena = (char *)arena;
+    g_dense_host_cache_pinned_capacity = budget;
+    fprintf(stderr, "ds4: CUDA dense host cache pinned arena %.2f GiB\n",
+            (double)budget / 1073741824.0);
+    return 1;
+}
+
+static const char *cuda_dense_host_cache_ptr(uint64_t offset, uint64_t bytes) {
+    if (bytes == 0 || cuda_dense_host_cache_budget_bytes() == 0 ||
+        !g_dense_host_cache_pinned_arena) return NULL;
+    const char *ptr = NULL;
+    pthread_mutex_lock(&g_dense_host_cache_mu);
+    const uint64_t end = offset + bytes;
+    if (end >= offset) {
+        for (const cuda_dense_host_cache_entry &e : g_dense_host_cache_entries) {
+            const uint64_t e_end = e.source_offset + e.bytes;
+            if (e_end >= e.source_offset && offset >= e.source_offset && end <= e_end) {
+                ptr = e.data + (offset - e.source_offset);
+                g_dense_host_cache_hits++;
+                g_dense_host_cache_hit_bytes += bytes;
+                break;
+            }
+        }
+    }
+    if (!ptr) g_dense_host_cache_misses++;
+    pthread_mutex_unlock(&g_dense_host_cache_mu);
+    return ptr;
+}
+
+static int cuda_dense_host_cache_copy(void *dst, uint64_t offset, uint64_t bytes) {
+    if (!dst || bytes == 0 || cuda_dense_host_cache_budget_bytes() == 0) return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_dense_host_cache_mu);
+    const uint64_t end = offset + bytes;
+    if (end >= offset) {
+        for (const cuda_dense_host_cache_entry &e : g_dense_host_cache_entries) {
+            const uint64_t e_end = e.source_offset + e.bytes;
+            if (e_end >= e.source_offset && offset >= e.source_offset && end <= e_end) {
+                memcpy(dst, e.data + (offset - e.source_offset), (size_t)bytes);
+                g_dense_host_cache_hits++;
+                g_dense_host_cache_hit_bytes += bytes;
+                found = 1;
+                break;
+            }
+        }
+    }
+    if (!found) g_dense_host_cache_misses++;
+    pthread_mutex_unlock(&g_dense_host_cache_mu);
+    return found;
+}
+
+static void cuda_dense_host_cache_store(uint64_t offset, uint64_t bytes,
+                                        const void *src) {
+    const uint64_t budget = cuda_dense_host_cache_budget_bytes();
+    if (!src || bytes == 0 || budget == 0 || bytes > budget) return;
+    const uint64_t end = offset + bytes;
+    if (end < offset) return;
+
+    pthread_mutex_lock(&g_dense_host_cache_mu);
+    for (const cuda_dense_host_cache_entry &e : g_dense_host_cache_entries) {
+        const uint64_t e_end = e.source_offset + e.bytes;
+        if (e_end >= e.source_offset && offset >= e.source_offset && end <= e_end) {
+            pthread_mutex_unlock(&g_dense_host_cache_mu);
+            return;
+        }
+    }
+    if (g_dense_host_cache_used > budget || bytes > budget - g_dense_host_cache_used) {
+        g_dense_host_cache_skipped_bytes += bytes;
+        pthread_mutex_unlock(&g_dense_host_cache_mu);
+        return;
+    }
+    char *data = NULL;
+    const int want_pinned = cuda_dense_host_cache_pinned_enabled();
+    const int use_pinned = want_pinned &&
+        cuda_dense_host_cache_pinned_ensure(budget);
+    if (use_pinned) {
+        if (g_dense_host_cache_used > g_dense_host_cache_pinned_capacity ||
+            bytes > g_dense_host_cache_pinned_capacity - g_dense_host_cache_used) {
+            g_dense_host_cache_skipped_bytes += bytes;
+            pthread_mutex_unlock(&g_dense_host_cache_mu);
+            return;
+        }
+        data = g_dense_host_cache_pinned_arena + g_dense_host_cache_used;
+    }
+    g_dense_host_cache_used += bytes; /* reserve before the potentially slow memcpy */
+    pthread_mutex_unlock(&g_dense_host_cache_mu);
+
+    if (!use_pinned) data = (char *)malloc((size_t)bytes);
+    if (!data) {
+        pthread_mutex_lock(&g_dense_host_cache_mu);
+        g_dense_host_cache_used -= bytes;
+        g_dense_host_cache_skipped_bytes += bytes;
+        pthread_mutex_unlock(&g_dense_host_cache_mu);
+        return;
+    }
+    memcpy(data, src, (size_t)bytes);
+
+    pthread_mutex_lock(&g_dense_host_cache_mu);
+    for (const cuda_dense_host_cache_entry &e : g_dense_host_cache_entries) {
+        const uint64_t e_end = e.source_offset + e.bytes;
+        if (e_end >= e.source_offset && offset >= e.source_offset && end <= e_end) {
+            if (!use_pinned) g_dense_host_cache_used -= bytes;
+            pthread_mutex_unlock(&g_dense_host_cache_mu);
+            if (!use_pinned) free(data);
+            return;
+        }
+    }
+    try {
+        g_dense_host_cache_entries.push_back({offset, bytes, data});
+        g_dense_host_cache_fill_bytes += bytes;
+        data = NULL;
+    } catch (...) {
+        g_dense_host_cache_used -= bytes;
+        g_dense_host_cache_skipped_bytes += bytes;
+    }
+    pthread_mutex_unlock(&g_dense_host_cache_mu);
+    if (data && !use_pinned) free(data);
+}
+
+static void cuda_dense_host_cache_release(void) {
+    pthread_mutex_lock(&g_dense_host_cache_mu);
+    if (g_dense_host_cache_fill_bytes || g_dense_host_cache_hits) {
+        fprintf(stderr,
+                "ds4: CUDA dense host cache summary: resident=%.2f GiB entries=%zu "
+                "hits=%llu misses=%llu served=%.2f GiB filled=%.2f GiB skipped=%.2f GiB\n",
+                (double)g_dense_host_cache_used / 1073741824.0,
+                g_dense_host_cache_entries.size(),
+                (unsigned long long)g_dense_host_cache_hits,
+                (unsigned long long)g_dense_host_cache_misses,
+                (double)g_dense_host_cache_hit_bytes / 1073741824.0,
+                (double)g_dense_host_cache_fill_bytes / 1073741824.0,
+                (double)g_dense_host_cache_skipped_bytes / 1073741824.0);
+    }
+    if (g_dense_host_cache_pinned_arena) {
+        (void)cudaFreeHost(g_dense_host_cache_pinned_arena);
+        g_dense_host_cache_pinned_arena = NULL;
+        g_dense_host_cache_pinned_capacity = 0;
+    } else {
+        for (cuda_dense_host_cache_entry &e : g_dense_host_cache_entries) free(e.data);
+    }
+    g_dense_host_cache_pinned_failed = 0;
+    g_dense_host_cache_entries.clear();
+    g_dense_host_cache_used = 0;
+    g_dense_host_cache_hits = 0;
+    g_dense_host_cache_misses = 0;
+    g_dense_host_cache_hit_bytes = 0;
+    g_dense_host_cache_fill_bytes = 0;
+    g_dense_host_cache_skipped_bytes = 0;
+    pthread_mutex_unlock(&g_dense_host_cache_mu);
+}
+
+static int cuda_dense_readahead_enabled(void) {
+    const char *env = getenv("DS4_CUDA_LOW_VRAM_DENSE_READAHEAD");
+    return g_cuda_low_vram_stream && g_ssd_streaming_mode && env && env[0] &&
+           strcmp(env, "0") != 0;
+}
+
+static uint64_t cuda_dense_readahead_bank_bytes(void) {
+    return (cuda_low_vram_stage_budget_bytes() / 2u) & ~UINT64_C(255);
+}
+
+static uint64_t cuda_dense_readahead_limit_bytes(void) {
+    const uint64_t bank = cuda_dense_readahead_bank_bytes();
+    /* Keep large reads on the demand path: consuming almost a whole half-bank
+     * increases SSD/PCIe contention more than the added overlap repays. */
+    const uint64_t conservative = UINT64_C(256) << 20;
+    return bank < conservative ? bank : conservative;
+}
+
+static void *cuda_dense_readahead_worker(void *) {
+    cuda_dense_readahead_prefetch &p = g_dense_readahead_prefetch;
+    p.ok = cudaSetDevice(p.device) == cudaSuccess;
+    const uint64_t chunk = UINT64_C(8) << 20;
+    uint64_t chunk_index = 0;
+    for (const cuda_dense_readahead_range &r : p.ranges) {
+        for (uint64_t off = 0; p.ok && off < r.bytes; off += chunk) {
+            if (p.cancel.load(std::memory_order_relaxed)) {
+                p.ok = false;
+                break;
+            }
+            const unsigned ring = (unsigned)(chunk_index & 1u);
+            if (chunk_index >= 2u && cudaEventSynchronize(p.ready[ring]) != cudaSuccess) {
+                p.ok = false;
+                break;
+            }
+            const uint64_t n = r.bytes - off < chunk ? r.bytes - off : chunk;
+            const uint64_t source_at = r.source_offset + off;
+            const char *payload = cuda_dense_host_cache_ptr(source_at, n);
+            int host_hit = payload != NULL;
+            if (!host_hit) {
+                payload = (const char *)p.stage[ring];
+                host_hit = cuda_dense_host_cache_copy(p.stage[ring], source_at, n);
+                if (host_hit) payload = (const char *)p.stage[ring];
+            }
+            if (!host_hit &&
+                !cuda_model_stage_read_from(p.fd, &p.direct_fd, p.align, p.file_size,
+                                            p.stage[ring], p.stage_bytes,
+                                            source_at, n, &payload)) {
+                p.ok = false;
+                break;
+            }
+            if (!host_hit) cuda_dense_host_cache_store(source_at, n, payload);
+            if (p.cancel.load(std::memory_order_relaxed)) {
+                p.ok = false;
+                break;
+            }
+            if (cudaMemcpyAsync(p.device_base + r.device_offset + off, payload, (size_t)n,
+                                cudaMemcpyHostToDevice, p.stream) != cudaSuccess ||
+                cudaEventRecord(p.ready[ring], p.stream) != cudaSuccess) {
+                p.ok = false;
+                break;
+            }
+#if defined(POSIX_FADV_DONTNEED)
+            if (p.direct_fd < 0)
+                (void)posix_fadvise(p.fd, (off_t)(r.source_offset + off),
+                                    (off_t)n, POSIX_FADV_DONTNEED);
+#endif
+            p.bytes += n;
+            chunk_index++;
+        }
+        if (!p.ok) break;
+    }
+    if (p.stream && cudaStreamSynchronize(p.stream) != cudaSuccess) p.ok = false;
+    return NULL;
+}
+
+static int cuda_dense_readahead_finish(int cancel) {
+    cuda_dense_readahead_prefetch &p = g_dense_readahead_prefetch;
+    if (!p.active) return 1;
+    if (cancel) p.cancel.store(true, std::memory_order_relaxed);
+    const int joined = pthread_join(p.thread, NULL) == 0;
+    p.active = false;
+    if (p.direct_fd >= 0) (void)close(p.direct_fd);
+    if (p.fd >= 0) (void)close(p.fd);
+    p.direct_fd = -1;
+    p.fd = -1;
+    if (!joined) {
+        fprintf(stderr, "ds4: CUDA dense read-ahead pthread_join failed\n");
+        p.ok = false;
+    }
+    if (!cancel && p.ok) {
+        g_dense_readahead_completed++;
+        g_dense_readahead_bytes += p.bytes;
+    }
+    return !cancel && p.ok;
+}
+
+static int cuda_dense_readahead_resources(void) {
+    cuda_dense_readahead_prefetch &p = g_dense_readahead_prefetch;
+    if (p.stream) return 1;
+    p.align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    p.stage_bytes = (UINT64_C(8) << 20) + p.align;
+    if (cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking) != cudaSuccess) {
+        p.stream = NULL;
+        return 0;
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        if (cudaMallocHost(&p.stage_raw[i], (size_t)(p.stage_bytes + p.align)) != cudaSuccess ||
+            cudaEventCreateWithFlags(&p.ready[i], cudaEventDisableTiming) != cudaSuccess) {
+            for (unsigned j = 0; j <= i; j++) {
+                if (p.ready[j]) (void)cudaEventDestroy(p.ready[j]);
+                if (p.stage_raw[j]) (void)cudaFreeHost(p.stage_raw[j]);
+                p.ready[j] = NULL;
+                p.stage_raw[j] = p.stage[j] = NULL;
+            }
+            (void)cudaStreamDestroy(p.stream);
+            p.stream = NULL;
+            return 0;
+        }
+        p.stage[i] = cuda_align_ptr(p.stage_raw[i], p.align);
+    }
+    return 1;
+}
+
+static int cuda_dense_readahead_start(uint32_t layer) {
+    if (!cuda_dense_readahead_enabled() || layer >= 128u ||
+        g_dense_readahead_bank < 0 || !g_low_vram_stage_device) return 0;
+    cuda_dense_readahead_plan &plan = g_dense_readahead_plan[layer];
+    const uint64_t bank_bytes = cuda_dense_readahead_bank_bytes();
+    const uint64_t limit = cuda_dense_readahead_limit_bytes();
+    if (!plan.ready || plan.packed_bytes == 0) return 0;
+    if (plan.packed_bytes > limit) {
+        g_dense_readahead_skipped_large++;
+        return 0;
+    }
+    cuda_dense_readahead_prefetch &p = g_dense_readahead_prefetch;
+    if (p.active) (void)cuda_dense_readahead_finish(1);
+    if (!cuda_dense_readahead_resources()) return 0;
+
+    p.layer = layer;
+    p.bank = (uint32_t)(1 - g_dense_readahead_bank);
+    p.ranges.clear();
+    uint64_t cursor = (uint64_t)p.bank * bank_bytes;
+    const uint64_t end = cursor + bank_bytes;
+    for (const cuda_dense_readahead_range &src : plan.ranges) {
+        cursor = (cursor + 255u) & ~UINT64_C(255);
+        if (cursor > end || src.bytes > end - cursor) return 0;
+        p.ranges.push_back({src.source_offset, src.bytes, cursor});
+        cursor += src.bytes;
+    }
+    p.fd = dup(g_model_fd);
+    if (p.fd < 0) return 0;
+    p.direct_fd = g_model_direct_fd >= 0 ? dup(g_model_direct_fd) : -1;
+    p.align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    p.file_size = g_model_file_size;
+    p.device_base = g_low_vram_stage_device;
+    p.bytes = 0;
+    p.ok = false;
+    p.cancel.store(false, std::memory_order_relaxed);
+    if (cudaGetDevice(&p.device) != cudaSuccess ||
+        pthread_create(&p.thread, NULL, cuda_dense_readahead_worker, NULL) != 0) {
+        if (p.direct_fd >= 0) (void)close(p.direct_fd);
+        (void)close(p.fd);
+        p.direct_fd = p.fd = -1;
+        return 0;
+    }
+    p.active = true;
+    g_dense_readahead_started++;
+    return 1;
+}
+
+static void cuda_dense_readahead_reset(void) {
+    (void)cuda_dense_readahead_finish(1);
+    cuda_dense_readahead_prefetch &p = g_dense_readahead_prefetch;
+    if (g_dense_readahead_started || g_dense_readahead_hits) {
+        fprintf(stderr,
+                "ds4: CUDA dense read-ahead summary: started=%llu completed=%llu "
+                "hits=%llu bytes=%.2f GiB skipped-large=%llu\n",
+                (unsigned long long)g_dense_readahead_started,
+                (unsigned long long)g_dense_readahead_completed,
+                (unsigned long long)g_dense_readahead_hits,
+                (double)g_dense_readahead_bytes / 1073741824.0,
+                (unsigned long long)g_dense_readahead_skipped_large);
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        if (p.ready[i]) (void)cudaEventDestroy(p.ready[i]);
+        if (p.stage_raw[i]) (void)cudaFreeHost(p.stage_raw[i]);
+        p.ready[i] = NULL;
+        p.stage_raw[i] = p.stage[i] = NULL;
+    }
+    if (p.stream) (void)cudaStreamDestroy(p.stream);
+    p.stream = NULL;
+    p.stage_bytes = 0;
+    p.ranges.clear();
+    for (cuda_dense_readahead_plan &plan : g_dense_readahead_plan) {
+        plan.ranges.clear();
+        plan.packed_bytes = 0;
+        plan.ready = false;
+    }
+    g_dense_readahead_layer = -1;
+    g_dense_readahead_bank = -1;
+    g_dense_readahead_window_begin = 0;
+    g_dense_readahead_window_end = 0;
+    g_dense_readahead_started = 0;
+    g_dense_readahead_completed = 0;
+    g_dense_readahead_hits = 0;
+    g_dense_readahead_skipped_large = 0;
+    g_dense_readahead_bytes = 0;
+}
+
+extern "C" void ds4_gpu_low_vram_dense_layer_begin(uint32_t layer) {
+    if (!cuda_dense_readahead_enabled() || layer >= 128u) return;
+    const uint64_t bank_bytes = cuda_dense_readahead_bank_bytes();
+    const uint64_t limit = cuda_dense_readahead_limit_bytes();
+    cuda_dense_readahead_plan &plan = g_dense_readahead_plan[layer];
+    bool published = false;
+
+    cuda_dense_readahead_prefetch &p = g_dense_readahead_prefetch;
+    if (p.active) {
+        const bool match = p.layer == layer;
+        const int ok = cuda_dense_readahead_finish(match ? 0 : 1);
+        if (match && ok && p.device_base == g_low_vram_stage_device) {
+            g_low_vram_stage_entries.clear();
+            uint64_t used = (uint64_t)p.bank * bank_bytes;
+            for (const cuda_dense_readahead_range &r : p.ranges) {
+                g_low_vram_stage_entries.push_back(
+                    {g_model_fd_host_base, r.source_offset, r.bytes, r.device_offset});
+                const uint64_t tail = r.device_offset + r.bytes;
+                if (tail > used) used = tail;
+            }
+            g_low_vram_stage_used = used;
+            g_dense_readahead_bank = (int32_t)p.bank;
+            g_dense_readahead_window_begin = (uint64_t)p.bank * bank_bytes;
+            g_dense_readahead_window_end = g_dense_readahead_window_begin + bank_bytes;
+            g_dense_readahead_hits++;
+            published = true;
+        }
+        p.ranges.clear();
+    }
+
+    if (!published) {
+        g_low_vram_stage_entries.clear();
+        if (plan.ready && plan.packed_bytes <= limit) {
+            g_dense_readahead_bank = 0;
+            g_dense_readahead_window_begin = 0;
+            g_dense_readahead_window_end = bank_bytes;
+            g_low_vram_stage_used = 0;
+        } else {
+            g_dense_readahead_bank = -1;
+            g_dense_readahead_window_begin = 0;
+            g_dense_readahead_window_end = cuda_low_vram_stage_budget_bytes();
+            g_low_vram_stage_used = 0;
+        }
+    }
+    g_dense_readahead_layer = (int32_t)layer;
+    if (!plan.ready) {
+        plan.ranges.clear();
+        plan.packed_bytes = 0;
+    }
+}
+
+extern "C" void ds4_gpu_low_vram_dense_prefetch_next_early(uint32_t layer) {
+    if (!cuda_dense_readahead_enabled() || layer >= 128u ||
+        g_dense_readahead_layer < 0 || g_dense_readahead_layer >= 128 ||
+        g_dense_readahead_prefetch.active || g_dense_readahead_bank < 0) return;
+    const cuda_dense_readahead_plan &current =
+        g_dense_readahead_plan[(uint32_t)g_dense_readahead_layer];
+    /* During the learning token the current layer is incomplete. From the
+     * second token onward its plan is stable, so start L+1 before L compute
+     * instead of after it. */
+    if (current.ready) (void)cuda_dense_readahead_start(layer);
+}
+
+extern "C" void ds4_gpu_low_vram_dense_prefetch_next(uint32_t layer) {
+    if (!cuda_dense_readahead_enabled() || layer >= 128u) return;
+    if (g_dense_readahead_layer >= 0 && g_dense_readahead_layer < 128) {
+        cuda_dense_readahead_plan &current =
+            g_dense_readahead_plan[(uint32_t)g_dense_readahead_layer];
+        if (!current.ready) {
+            current.ready = true;
+            fprintf(stderr,
+                    "ds4: CUDA dense read-ahead learned layer=%d ranges=%zu bytes=%.2f MiB eligible=%d\n",
+                    g_dense_readahead_layer, current.ranges.size(),
+                    (double)current.packed_bytes / 1048576.0,
+                    current.packed_bytes <= cuda_dense_readahead_limit_bytes());
+        }
+    }
+    if (g_dense_readahead_bank >= 0 && !g_dense_readahead_prefetch.active)
+        (void)cuda_dense_readahead_start(layer);
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -2407,16 +3189,26 @@ static int cuda_model_copy_to_device_streamed(
                 return 0;
             }
         }
-        const char *payload = NULL;
-        if (!cuda_model_stage_read(g_stream_selected_stage[bi],
+        const uint64_t source_at = offset + copied;
+        const char *payload = cuda_expert_host_chunk_ptr(source_at, n);
+        int host_hit = payload != NULL;
+        if (!host_hit) {
+            payload = (const char *)g_stream_selected_stage[bi];
+            host_hit = cuda_expert_host_chunk_copy(
+                    g_stream_selected_stage[bi], source_at, n);
+            if (host_hit) payload = (const char *)g_stream_selected_stage[bi];
+        }
+        if (!host_hit &&
+            !cuda_model_stage_read(g_stream_selected_stage[bi],
                                    g_stream_selected_stage_bytes,
-                                   offset + copied, n, &payload)) {
+                                   source_at, n, &payload)) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected read failed for %s at %.2f MiB: %s\n",
                     what ? what : "expert", (double)copied / 1048576.0,
                     strerror(errno));
             return 0;
         }
+        if (!host_hit) cuda_expert_host_chunk_store(source_at, n, payload);
         err = cudaMemcpyAsync(dst + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice,
                               g_stream_selected_upload_stream);
@@ -2439,9 +3231,11 @@ static int cuda_model_copy_to_device_streamed(
         }
         g_stream_selected_stage_recorded[bi] = 1;
         g_stream_selected_stage_next++;
-        cuda_model_drop_file_pages(offset + copied, n);
-        cuda_model_discard_source_pages(model_map, model_size,
-                                        offset + copied, n);
+        if (!host_hit) {
+            cuda_model_drop_file_pages(offset + copied, n);
+            cuda_model_discard_source_pages(model_map, model_size,
+                                            offset + copied, n);
+        }
         copied += n;
     }
     return 1;
@@ -2617,6 +3411,7 @@ static uint32_t cuda_stream_persistent_cache_key(
     return table->layer * DS4_CUDA_STREAM_CACHE_MAX_EXPERTS + expert;
 }
 
+
 static int cuda_stream_persistent_cache_init(
         const ds4_gpu_stream_expert_table *table, uint32_t selected_count) {
     cuda_stream_expert_persistent_cache *cache =
@@ -2774,6 +3569,7 @@ static int cuda_stream_persistent_cache_init(
             (double)one_gib / 1073741824.0);
     return 1;
 }
+
 
 static int cuda_stream_persistent_cache_load_selected(
         const ds4_gpu_stream_expert_table *table,
@@ -3171,6 +3967,8 @@ static int cuda_low_vram_stage_preallocate(void) {
 }
 
 static void cuda_low_vram_stage_invalidate(void) {
+    cuda_dense_readahead_reset();
+    cuda_dense_host_cache_release();
     /*
      * A model-map change invalidates staged source ranges, but the fixed
      * low-VRAM device arena is a process-level reservation and must remain
@@ -3185,6 +3983,8 @@ static void cuda_low_vram_stage_invalidate(void) {
 }
 
 static void cuda_low_vram_stage_release(void) {
+    cuda_dense_readahead_reset();
+    cuda_dense_host_cache_release();
     if (g_low_vram_stage_upload_ranges != 0) {
         fprintf(stderr,
                 "ds4: CUDA low-VRAM stage summary: ranges=%llu bytes=%.2f GiB hits=%llu epoch-resets=%llu peak=%.2f MiB budget=%.2f MiB\n",
@@ -3300,9 +4100,14 @@ static const char *cuda_low_vram_stage_range(
     }
 
     const uint64_t align = 256u;
+    const bool dense_window = cuda_dense_readahead_enabled() &&
+        g_dense_readahead_layer >= 0 && g_dense_readahead_window_end != 0;
+    const uint64_t window_end = dense_window ? g_dense_readahead_window_end : budget;
+    if (dense_window && g_low_vram_stage_used < g_dense_readahead_window_begin)
+        g_low_vram_stage_used = g_dense_readahead_window_begin;
     uint64_t device_offset =
         (g_low_vram_stage_used + align - 1u) & ~(align - 1u);
-    if (device_offset > budget || bytes > budget - device_offset) {
+    if (device_offset > window_end || bytes > window_end - device_offset) {
         /* Never recycle here: a fused launcher may already hold pointers to
          * earlier entries but not have launched its kernel yet. Reuse happens
          * only after a successful CUDA completion fence. */
@@ -3311,7 +4116,7 @@ static const char *cuda_low_vram_stage_range(
                 "but only %.2f MiB remains; increase "
                 "DS4_CUDA_LOW_VRAM_STAGE_MB\n",
                 what ? what : "weights", (double)bytes / 1048576.0,
-                (double)(budget - device_offset) / 1048576.0);
+                (double)(window_end > device_offset ? window_end - device_offset : 0) / 1048576.0);
         return NULL;
     }
 
@@ -3338,15 +4143,24 @@ static const char *cuda_low_vram_stage_range(
             }
         }
         last_bi = bi;
-        const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
-                                   offset + copied, n, &payload)) {
+        const uint64_t source_at = offset + copied;
+        const char *payload = cuda_dense_host_cache_ptr(source_at, n);
+        int host_hit = payload != NULL;
+        if (!host_hit) {
+            payload = (const char *)g_model_stage[bi];
+            host_hit = cuda_dense_host_cache_copy(g_model_stage[bi], source_at, n);
+            if (host_hit) payload = (const char *)g_model_stage[bi];
+        }
+        if (!host_hit &&
+            !cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+                                   source_at, n, &payload)) {
             fprintf(stderr,
                     "ds4: CUDA low-VRAM file read failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights", (double)copied / 1048576.0,
                     strerror(errno));
             return NULL;
         }
+        if (!host_hit) cuda_dense_host_cache_store(source_at, n, payload);
         cudaError_t copy_err = cudaMemcpyAsync(
                 g_low_vram_stage_device + device_offset + copied,
                 payload, (size_t)n,
@@ -3378,6 +4192,16 @@ static const char *cuda_low_vram_stage_range(
     }
     g_low_vram_stage_entries.push_back(
         {model_map, offset, bytes, device_offset});
+    if (cuda_dense_readahead_enabled() && g_dense_readahead_layer >= 0 &&
+        g_dense_readahead_layer < 128) {
+        cuda_dense_readahead_plan &plan =
+            g_dense_readahead_plan[(uint32_t)g_dense_readahead_layer];
+        if (!plan.ready) {
+            const uint64_t packed = (plan.packed_bytes + 255u) & ~UINT64_C(255);
+            plan.ranges.push_back({offset, bytes, 0});
+            plan.packed_bytes = packed + bytes;
+        }
+    }
     g_low_vram_stage_used = device_offset + bytes;
     if (g_low_vram_stage_used > g_low_vram_stage_peak_used) {
         g_low_vram_stage_peak_used = g_low_vram_stage_used;

@@ -40191,6 +40191,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
         !ds4_gpu_begin_commands()) return false;
+#if !defined(__APPLE__)
+    if (g->streaming) {
+        ds4_gpu_low_vram_dense_layer_begin(0);
+        ds4_gpu_low_vram_dense_prefetch_next_early(1u % DS4_N_LAYER);
+    }
+#endif
     bool ok = ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
@@ -40200,6 +40206,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+#if !defined(__APPLE__)
+        if (g->streaming && il != 0) {
+            ds4_gpu_low_vram_dense_layer_begin(il);
+            ds4_gpu_low_vram_dense_prefetch_next_early((il + 1u) % DS4_N_LAYER);
+        }
+#endif
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
@@ -40207,6 +40219,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         if (ok) ok = ds41_graph_layer(g, m, l, il, token);
+#if !defined(__APPLE__)
+        if (ok && g->streaming)
+            ds4_gpu_low_vram_dense_prefetch_next((il + 1u) % DS4_N_LAYER);
+#endif
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
