@@ -2,6 +2,8 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+> **Bot-tazzi Motor downstream branch:** this repository variant contains experimental low-VRAM CUDA/NVMe optimizations for DeepSeek V4.1 Flash on an RTX 2070-class 8 GiB GPU. It is built on DwarfStar / DS4 by **Salvatore "antirez" Sanfilippo**; the upstream project and its contributors are the foundation of this work. See [BOTTAZZI_MOTOR.md](BOTTAZZI_MOTOR.md) for the exact changes, benchmarks, credits and reproducibility notes.
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building

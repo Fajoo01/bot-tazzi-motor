@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <atomic>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -863,6 +864,17 @@ static cudaEvent_t g_stream_selected_stage_event[4];
 static uint64_t g_stream_selected_stage_bytes;
 static uint64_t g_stream_selected_stage_next;
 static int g_stream_selected_stage_recorded[4];
+static void *g_stream_selected_packed_host;
+static uint64_t g_stream_selected_packed_host_bytes;
+static int g_stream_expert_pack_fd = -1;
+static int g_stream_expert_pack_checked;
+static uint64_t g_stream_expert_pack_record_bytes;
+static uint64_t g_stream_expert_pack_gate_bytes;
+static uint64_t g_stream_expert_pack_up_bytes;
+static uint64_t g_stream_expert_pack_down_bytes;
+static uint64_t g_stream_expert_pack_header_bytes;
+static uint32_t g_stream_expert_pack_layers;
+static uint32_t g_stream_expert_pack_experts;
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
@@ -3082,6 +3094,11 @@ static void cuda_stream_selected_stage_release(void) {
     g_stream_selected_stage_next = 0;
     memset(g_stream_selected_stage_recorded, 0,
            sizeof(g_stream_selected_stage_recorded));
+    if (g_stream_selected_packed_host) {
+        (void)cudaFreeHost(g_stream_selected_packed_host);
+        g_stream_selected_packed_host = NULL;
+        g_stream_selected_packed_host_bytes = 0;
+    }
     if (g_stream_selected_upload_stream) {
         (void)cudaStreamDestroy(g_stream_selected_upload_stream);
         g_stream_selected_upload_stream = NULL;
@@ -3124,6 +3141,365 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_stream_selected_stage_bytes = bytes;
+    return 1;
+}
+
+typedef struct {
+    char *dst;
+    uint64_t offset;
+    uint64_t bytes;
+} cuda_stream_selected_read_task;
+
+static int cuda_stream_selected_packed_host_ensure(uint64_t bytes) {
+    if (g_stream_selected_packed_host &&
+        g_stream_selected_packed_host_bytes >= bytes) return 1;
+    if (g_stream_selected_packed_host) {
+        (void)cudaFreeHost(g_stream_selected_packed_host);
+        g_stream_selected_packed_host = NULL;
+        g_stream_selected_packed_host_bytes = 0;
+    }
+    if (!bytes || bytes > (uint64_t)SIZE_MAX) return 0;
+    void *ptr = NULL;
+    const cudaError_t err = cudaMallocHost(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_selected_packed_host = ptr;
+    g_stream_selected_packed_host_bytes = bytes;
+    return 1;
+}
+
+static int cuda_stream_expert_pack_open(const ds4_gpu_stream_expert_table *table) {
+    if (g_stream_expert_pack_checked)
+        return g_stream_expert_pack_fd >= 0;
+    g_stream_expert_pack_checked = 1;
+    const char *path = getenv("DS4_CUDA_V41_EXPERT_PACK_FILE");
+    if (!path || !path[0] || !table) return 0;
+#if defined(__linux__) && defined(O_DIRECT)
+    const int fd = open(path, O_RDONLY | O_DIRECT);
+#else
+    const int fd = open(path, O_RDONLY);
+#endif
+    if (fd < 0) return 0;
+    void *raw = NULL;
+    const uint64_t align = 4096u;
+    if (posix_memalign(&raw, (size_t)align, (size_t)align) != 0 || !raw) {
+        close(fd); return 0;
+    }
+    const int read_ok = cuda_pread_full(fd, raw, align, 0);
+    if (!read_ok || memcmp(raw, "BTZMTR01", 8) != 0) {
+        free(raw); close(fd); return 0;
+    }
+    const uint32_t *u = (const uint32_t *)raw;
+    const uint64_t *q = (const uint64_t *)((const char *)raw + 24);
+    const uint32_t version = u[2];
+    const uint32_t layers = u[3];
+    const uint32_t experts = u[4];
+    const uint32_t header = u[5];
+    const uint64_t gate_b = q[0], up_b = q[1], down_b = q[2];
+    const uint64_t record_b = q[3], model_b = q[4], complete = q[6];
+    struct stat st = {};
+    const uint64_t expected_size = (uint64_t)header +
+        (uint64_t)layers * experts * record_b;
+    const int valid = version == 1u && complete == 1u &&
+        layers >= 40u && experts == table->n_total_expert &&
+        header == 4096u && gate_b == table->gate_expert_bytes &&
+        up_b == table->gate_expert_bytes && down_b == table->down_expert_bytes &&
+        record_b == gate_b + up_b + down_b && model_b == g_model_file_size &&
+        fstat(fd, &st) == 0 && (uint64_t)st.st_size == expected_size &&
+        (record_b % align) == 0;
+    free(raw);
+    if (!valid) { close(fd); return 0; }
+    g_stream_expert_pack_fd = fd;
+    g_stream_expert_pack_record_bytes = record_b;
+    g_stream_expert_pack_gate_bytes = gate_b;
+    g_stream_expert_pack_up_bytes = up_b;
+    g_stream_expert_pack_down_bytes = down_b;
+    g_stream_expert_pack_header_bytes = header;
+    g_stream_expert_pack_layers = layers;
+    g_stream_expert_pack_experts = experts;
+    fprintf(stderr,
+            "ds4: Bot-tazzi Motor expert pack enabled: %u layers x %u experts, %.2f MiB/frame\n",
+            layers, experts, (double)record_b / 1048576.0);
+    return 1;
+}
+
+static int cuda_stream_selected_load_expert_pack(
+        const ds4_gpu_stream_expert_table *table,
+        const std::vector<int32_t> &compact_ids,
+        char *host_gate, char *host_up, char *host_down,
+        uint32_t workers) {
+    if (!cuda_stream_expert_pack_open(table) || !table ||
+        table->layer >= g_stream_expert_pack_layers || compact_ids.empty()) return 0;
+    if (workers < 1u) workers = 1u;
+    if (workers > 8u) workers = 8u;
+    if (workers > compact_ids.size()) workers = (uint32_t)compact_ids.size();
+    std::atomic<uint32_t> next(0u);
+    std::atomic<int> failed(0);
+    auto reader = [&]() {
+        void *scratch_raw = NULL;
+        if (posix_memalign(&scratch_raw, 4096u,
+                           (size_t)g_stream_expert_pack_record_bytes) != 0 || !scratch_raw) {
+            failed.store(1, std::memory_order_relaxed); return;
+        }
+        char *scratch = (char *)scratch_raw;
+        while (!failed.load(std::memory_order_relaxed)) {
+            const uint32_t i = next.fetch_add(1u, std::memory_order_relaxed);
+            if (i >= compact_ids.size()) break;
+            const int32_t expert = compact_ids[i];
+            if (expert < 0 || (uint32_t)expert >= g_stream_expert_pack_experts) {
+                failed.store(1, std::memory_order_relaxed); break;
+            }
+            const uint64_t rec_index = (uint64_t)table->layer *
+                g_stream_expert_pack_experts + (uint32_t)expert;
+            const uint64_t off = g_stream_expert_pack_header_bytes +
+                rec_index * g_stream_expert_pack_record_bytes;
+            if (!cuda_pread_full(g_stream_expert_pack_fd, scratch,
+                                 g_stream_expert_pack_record_bytes, off)) {
+                failed.store(1, std::memory_order_relaxed); break;
+            }
+            memcpy(host_gate + (uint64_t)i * g_stream_expert_pack_gate_bytes,
+                   scratch, (size_t)g_stream_expert_pack_gate_bytes);
+            memcpy(host_up + (uint64_t)i * g_stream_expert_pack_up_bytes,
+                   scratch + g_stream_expert_pack_gate_bytes,
+                   (size_t)g_stream_expert_pack_up_bytes);
+            memcpy(host_down + (uint64_t)i * g_stream_expert_pack_down_bytes,
+                   scratch + g_stream_expert_pack_gate_bytes + g_stream_expert_pack_up_bytes,
+                   (size_t)g_stream_expert_pack_down_bytes);
+        }
+        free(scratch_raw);
+    };
+    std::vector<std::thread> pool;
+    try {
+        pool.reserve(workers);
+        for (uint32_t i = 0; i < workers; i++) pool.emplace_back(reader);
+    } catch (...) { failed.store(1, std::memory_order_relaxed); }
+    for (std::thread &t : pool) if (t.joinable()) t.join();
+    return failed.load(std::memory_order_relaxed) ? 0 : 1;
+}
+
+static int cuda_stream_selected_load_expert_pack_direct(
+        const ds4_gpu_stream_expert_table *table,
+        const std::vector<int32_t> &compact_ids,
+        char *gate_dst, char *up_dst, char *down_dst,
+        uint32_t workers) {
+    if (!getenv("DS4_CUDA_V41_EXPERT_FRAME_DIRECT") ||
+        !cuda_stream_expert_pack_open(table) || !table || compact_ids.empty() ||
+        !gate_dst || !up_dst || !down_dst) return 0;
+    const uint64_t count = compact_ids.size();
+    if (count > UINT64_MAX / g_stream_expert_pack_record_bytes) return 0;
+    const uint64_t total = count * g_stream_expert_pack_record_bytes;
+    if (!cuda_stream_selected_packed_host_ensure(total)) return 0;
+    char *frames = (char *)g_stream_selected_packed_host;
+    if (workers < 1u) workers = 1u;
+    if (workers > 8u) workers = 8u;
+    if (workers > compact_ids.size()) workers = (uint32_t)compact_ids.size();
+    std::atomic<uint32_t> next(0u);
+    std::atomic<int> failed(0);
+    auto reader = [&]() {
+        while (!failed.load(std::memory_order_relaxed)) {
+            const uint32_t i = next.fetch_add(1u, std::memory_order_relaxed);
+            if (i >= compact_ids.size()) break;
+            const int32_t expert = compact_ids[i];
+            if (expert < 0 || (uint32_t)expert >= g_stream_expert_pack_experts) {
+                failed.store(1, std::memory_order_relaxed); break;
+            }
+            char *frame = frames + (uint64_t)i * g_stream_expert_pack_record_bytes;
+            if (((uintptr_t)frame & 4095u) != 0u) {
+                failed.store(1, std::memory_order_relaxed); break;
+            }
+            const uint64_t rec_index = (uint64_t)table->layer *
+                g_stream_expert_pack_experts + (uint32_t)expert;
+            const uint64_t off = g_stream_expert_pack_header_bytes +
+                rec_index * g_stream_expert_pack_record_bytes;
+            if (!cuda_pread_full(g_stream_expert_pack_fd, frame,
+                                 g_stream_expert_pack_record_bytes, off)) {
+                failed.store(1, std::memory_order_relaxed); break;
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    try {
+        pool.reserve(workers);
+        for (uint32_t i = 0; i < workers; i++) pool.emplace_back(reader);
+    } catch (...) { failed.store(1, std::memory_order_relaxed); }
+    for (std::thread &t : pool) if (t.joinable()) t.join();
+    if (failed.load(std::memory_order_relaxed)) return 0;
+    for (uint64_t i = 0; i < count; i++) {
+        const char *frame = frames + i * g_stream_expert_pack_record_bytes;
+        cudaError_t err = cudaMemcpyAsync(
+            gate_dst + i * table->gate_expert_bytes,
+            frame, (size_t)table->gate_expert_bytes,
+            cudaMemcpyHostToDevice, g_stream_selected_upload_stream);
+        if (err == cudaSuccess) err = cudaMemcpyAsync(
+            up_dst + i * table->gate_expert_bytes,
+            frame + table->gate_expert_bytes,
+            (size_t)table->gate_expert_bytes,
+            cudaMemcpyHostToDevice, g_stream_selected_upload_stream);
+        if (err == cudaSuccess) err = cudaMemcpyAsync(
+            down_dst + i * table->down_expert_bytes,
+            frame + table->gate_expert_bytes * 2u,
+            (size_t)table->down_expert_bytes,
+            cudaMemcpyHostToDevice, g_stream_selected_upload_stream);
+        if (err != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    }
+    g_stream_selected_upload_bytes += total;
+    g_stream_selected_upload_ranges += count;
+    return 1;
+}
+
+
+static int cuda_stream_selected_load_packed_parallel(
+        const ds4_gpu_stream_expert_table *table,
+        const std::vector<int32_t> &compact_ids,
+        char *gate_dst, char *up_dst, char *down_dst) {
+    if (!table || compact_ids.empty() || !gate_dst || !up_dst || !down_dst ||
+        g_model_fd < 0 || table->model_map != g_model_fd_host_base) return 0;
+    const uint64_t count = compact_ids.size();
+    if (count > UINT64_MAX / table->gate_expert_bytes ||
+        count > UINT64_MAX / table->down_expert_bytes) return 0;
+    const uint64_t gate_bytes = count * table->gate_expert_bytes;
+    const uint64_t down_bytes = count * table->down_expert_bytes;
+    if (gate_bytes > UINT64_MAX - gate_bytes ||
+        gate_bytes * 2u > UINT64_MAX - down_bytes) return 0;
+    const uint64_t total = gate_bytes * 2u + down_bytes;
+    const uint64_t stage_bytes = cuda_model_copy_chunk_bytes() +
+        (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
+    if (!cuda_stream_selected_packed_host_ensure(total)) return 0;
+    char *host_gate = (char *)g_stream_selected_packed_host;
+    char *host_up = host_gate + gate_bytes;
+    char *host_down = host_up + gate_bytes;
+    std::vector<cuda_stream_selected_read_task> tasks;
+    try {
+        tasks.reserve((size_t)count * 3u);
+        /* Demux in physical tensor order, like a media reader: with compact_ids
+         * sorted this turns three interleaved random streams into three forward
+         * scans. Logical router order is restored by slot_ids, not by I/O order. */
+        for (uint64_t i = 0; i < count; i++) {
+            const uint64_t expert = (uint32_t)compact_ids[(size_t)i];
+            tasks.push_back({host_gate + i * table->gate_expert_bytes,
+                             table->gate_offset + expert * table->gate_expert_bytes,
+                             table->gate_expert_bytes});
+        }
+        for (uint64_t i = 0; i < count; i++) {
+            const uint64_t expert = (uint32_t)compact_ids[(size_t)i];
+            tasks.push_back({host_up + i * table->gate_expert_bytes,
+                             table->up_offset + expert * table->gate_expert_bytes,
+                             table->gate_expert_bytes});
+        }
+        for (uint64_t i = 0; i < count; i++) {
+            const uint64_t expert = (uint32_t)compact_ids[(size_t)i];
+            tasks.push_back({host_down + i * table->down_expert_bytes,
+                             table->down_offset + expert * table->down_expert_bytes,
+                             table->down_expert_bytes});
+        }
+    } catch (...) {
+        return 0;
+    }
+    uint32_t workers = 4u;
+    const char *threads_env = getenv("DS4_CUDA_V41_EXPERT_READ_THREADS");
+    if (threads_env && threads_env[0]) {
+        char *end = NULL;
+        const unsigned long v = strtoul(threads_env, &end, 10);
+        if (end != threads_env && *end == '\0') workers = (uint32_t)v;
+    }
+    if (workers < 1u) workers = 1u;
+    if (workers > 8u) workers = 8u;
+    if (workers > tasks.size()) workers = (uint32_t)tasks.size();
+    if (cuda_stream_selected_load_expert_pack_direct(
+            table, compact_ids, gate_dst, up_dst, down_dst, workers)) return 1;
+    if (cuda_stream_selected_load_expert_pack(table, compact_ids,
+                                               host_gate, host_up, host_down, workers)) {
+        cudaError_t err = cudaMemcpyAsync(gate_dst, host_gate, (size_t)gate_bytes,
+                                          cudaMemcpyHostToDevice,
+                                          g_stream_selected_upload_stream);
+        if (err == cudaSuccess)
+            err = cudaMemcpyAsync(up_dst, host_up, (size_t)gate_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  g_stream_selected_upload_stream);
+        if (err == cudaSuccess)
+            err = cudaMemcpyAsync(down_dst, host_down, (size_t)down_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  g_stream_selected_upload_stream);
+        if (err != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+        g_stream_selected_upload_bytes += total;
+        g_stream_selected_upload_ranges += compact_ids.size();
+        return 1;
+    }
+    /* Parallel buffered pread dirties/reclaims the model page cache heavily on
+     * long prompts.  The CUDA low-VRAM path already owns an O_DIRECT fd: use it
+     * strictly here, with one aligned scratch buffer per reader.  The exact
+     * expert payload is copied into the packed pinned arena after the aligned
+     * direct read, so arbitrary GGUF tensor offsets remain supported. */
+    if (g_model_direct_fd < 0 || g_model_direct_align <= 1 ||
+        g_model_file_size == 0) return 0;
+    uint64_t max_task_bytes = 0;
+    for (const cuda_stream_selected_read_task &t : tasks)
+        if (t.bytes > max_task_bytes) max_task_bytes = t.bytes;
+    const uint64_t align = g_model_direct_align;
+    if (max_task_bytes > UINT64_MAX - 2u * align) return 0;
+    const uint64_t scratch_bytes =
+        cuda_round_up(max_task_bytes + 2u * align, align);
+    std::atomic<uint32_t> next(0u);
+    std::atomic<int> failed(0);
+    auto reader = [&]() {
+        void *scratch_raw = NULL;
+        if (scratch_bytes > (uint64_t)SIZE_MAX ||
+            posix_memalign(&scratch_raw, (size_t)align,
+                           (size_t)scratch_bytes) != 0 || !scratch_raw) {
+            failed.store(1, std::memory_order_relaxed);
+            return;
+        }
+        char *scratch = (char *)scratch_raw;
+        while (!failed.load(std::memory_order_relaxed)) {
+            const uint32_t idx = next.fetch_add(1u, std::memory_order_relaxed);
+            if (idx >= tasks.size()) break;
+            const cuda_stream_selected_read_task &t = tasks[idx];
+            const uint64_t aligned_off = cuda_round_down(t.offset, align);
+            const uint64_t delta = t.offset - aligned_off;
+            if (delta > UINT64_MAX - t.bytes) {
+                failed.store(1, std::memory_order_relaxed);
+                break;
+            }
+            const uint64_t read_bytes = cuda_round_up(delta + t.bytes, align);
+            if (read_bytes > scratch_bytes || aligned_off > g_model_file_size ||
+                read_bytes > g_model_file_size - aligned_off ||
+                !cuda_pread_full(g_model_direct_fd, scratch, read_bytes, aligned_off)) {
+                failed.store(1, std::memory_order_relaxed);
+                break;
+            }
+            memcpy(t.dst, scratch + delta, (size_t)t.bytes);
+        }
+        free(scratch_raw);
+    };
+    std::vector<std::thread> pool;
+    try {
+        pool.reserve(workers);
+        for (uint32_t i = 0; i < workers; i++) pool.emplace_back(reader);
+    } catch (...) {
+        failed.store(1, std::memory_order_relaxed);
+    }
+    for (std::thread &t : pool) if (t.joinable()) t.join();
+    if (failed.load(std::memory_order_relaxed)) return 0;
+    cudaError_t err = cudaMemcpyAsync(gate_dst, host_gate, (size_t)gate_bytes,
+                                      cudaMemcpyHostToDevice,
+                                      g_stream_selected_upload_stream);
+    if (err == cudaSuccess)
+        err = cudaMemcpyAsync(up_dst, host_up, (size_t)gate_bytes,
+                              cudaMemcpyHostToDevice,
+                              g_stream_selected_upload_stream);
+    if (err == cudaSuccess)
+        err = cudaMemcpyAsync(down_dst, host_down, (size_t)down_bytes,
+                              cudaMemcpyHostToDevice,
+                              g_stream_selected_upload_stream);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_selected_upload_bytes += total;
+    g_stream_selected_upload_ranges += tasks.size();
     return 1;
 }
 
@@ -3715,8 +4091,11 @@ static int cuda_stream_persistent_cache_load_selected(
     } else {
         for (uint32_t i = 0; i < slot_ids->size(); i++) {
             const int32_t compact = (*slot_ids)[i];
-            if (compact < 0 ||
-                (uint32_t)compact >= physical_for_compact.size()) return 0;
+            if (compact < 0) {
+                if (compact == -1) continue;
+                return 0;
+            }
+            if ((uint32_t)compact >= physical_for_compact.size()) return 0;
             (*slot_ids)[i] = (int32_t)physical_for_compact[(uint32_t)compact];
         }
     }
@@ -28182,6 +28561,99 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              layer_index, n_tokens, 1, 0);
 }
 
+extern "C" int ds4_gpu_routed_moe_sum_slots_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *down,
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    if (!out || !down || !out_dim || !n_expert || !n_tokens) return 0;
+    const uint64_t out_elems = (uint64_t)n_tokens * out_dim;
+    const uint64_t down_elems = out_elems * n_expert;
+    if (out->bytes < out_elems * sizeof(float) ||
+        down->bytes < down_elems * sizeof(float)) return 0;
+    moe_mmq_sum_kernel<<<(uint32_t)((out_elems + 255u) / 256u), 256>>>(
+        (float *)out->ptr, (const float *)down->ptr, NULL,
+        out_dim, n_expert, n_tokens, /*guard_nonfinite=*/1);
+    return cuda_ok(cudaGetLastError(), "windowed mmq moe final sum launch");
+}
+
+extern "C" int ds4_gpu_routed_moe_iq2_cached_slice_tensor(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *x,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        uint32_t layer_index, uint32_t slot_offset, uint32_t n_tokens) {
+    if (!gate || !up || !mid || !down || !weights || !x ||
+        !n_tokens || !n_total_expert || !n_expert ||
+        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0) {
+        return 0;
+    }
+    const uint64_t slots = (uint64_t)n_tokens * n_expert;
+    if (slot_offset > g_stream_selected_cache.slot_count ||
+        slots > g_stream_selected_cache.slot_count - slot_offset ||
+        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
+        weights->bytes < slots * sizeof(float) ||
+        gate->bytes < slots * expert_mid_dim * sizeof(float) ||
+        up->bytes < slots * expert_mid_dim * sizeof(float) ||
+        mid->bytes < slots * expert_mid_dim * sizeof(float) ||
+        down->bytes < slots * out_dim * sizeof(float) ||
+        !g_ssd_streaming_mode || !g_stream_selected_cache.valid ||
+        g_stream_selected_cache.layer != layer_index ||
+        g_stream_selected_cache.n_total_expert != n_total_expert ||
+        !g_stream_selected_cache.gate_ptr ||
+        !g_stream_selected_cache.up_ptr ||
+        !g_stream_selected_cache.down_ptr ||
+        !g_stream_selected_cache.slot_selected_ptr) {
+        return 0;
+    }
+    const cudaStream_t stream = (cudaStream_t)0;
+    if (!cuda_stream_selected_cache_wait_ready(stream)) return 0;
+    const int persistent_direct = cuda_stream_selected_cache_uses_persistent_weights();
+    const uint32_t weight_experts = persistent_direct
+        ? g_stream_expert_persistent_cache.capacity
+        : g_stream_selected_cache.compact_count;
+    if (weight_experts < n_expert) return 0;
+    const char *gate_w = persistent_direct
+        ? g_stream_expert_persistent_cache.gate_ptr
+        : g_stream_selected_cache.gate_ptr;
+    const char *up_w = persistent_direct
+        ? g_stream_expert_persistent_cache.up_ptr
+        : g_stream_selected_cache.up_ptr;
+    const char *down_w = persistent_direct
+        ? g_stream_expert_persistent_cache.down_ptr
+        : g_stream_selected_cache.down_ptr;
+    const int32_t *selected = g_stream_selected_cache.slot_selected_ptr + slot_offset;
+    int rc = ds4_mmq_iq2_xxs_moe_pair(
+        gate_w, up_w, (const float *)x->ptr, selected,
+        (float *)gate->ptr, (float *)up->ptr,
+        (int)expert_mid_dim, (int)expert_in_dim,
+        (int)n_tokens, (int)weight_experts, (int)n_expert, stream);
+    if (rc == 0) {
+        const uint64_t mid_floats = slots * expert_mid_dim;
+        moe_mmq_swiglu_weighted_clamp_kernel<<<
+            (uint32_t)((mid_floats + 255u) / 256u), 256, 0, stream>>>(
+            (float *)mid->ptr,
+            (const float *)gate->ptr, (const float *)up->ptr,
+            (const float *)weights->ptr,
+            expert_mid_dim, n_tokens, n_expert, clamp);
+        rc = cuda_ok(cudaGetLastError(), "windowed mmq moe swiglu launch") ? 0 : -1;
+    }
+    if (rc == 0) {
+        rc = ds4_mmq_q2_K_moe(
+            down_w, (const float *)mid->ptr, selected,
+            (float *)down->ptr,
+            (int)out_dim, (int)expert_mid_dim,
+            (int)slots, (int)weight_experts,
+            /*n_expert_used=*/1, stream);
+    }
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4: windowed IQ2/Q2 routed-MoE rc=%d (layer=%u rows=%u slot_offset=%u)\n",
+                rc, layer_index, n_tokens, slot_offset);
+        return 0;
+    }
+    return cuda_stream_selected_cache_record_compute_done(layer_index, n_tokens);
+}
+
 extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -28845,7 +29317,8 @@ static int cuda_stream_selected_ranges_valid(
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
-        uint32_t slot_count) {
+        uint32_t slot_count,
+        int allow_negative) {
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
@@ -28902,7 +29375,17 @@ static int cuda_stream_selected_cache_begin_load(
     }
     for (uint32_t i = 0; i < slot_count; i++) {
         const int32_t expert = selected_ids[i];
-        if (expert < 0 || (uint32_t)expert >= table->n_total_expert) {
+        if (expert < 0) {
+            if (allow_negative) {
+                slot_ids[i] = -1;
+                continue;
+            }
+            fprintf(stderr,
+                    "ds4: CUDA streaming expert id %d is outside 0..%u at layer %u\n",
+                    expert, table->n_total_expert, table->layer);
+            return 0;
+        }
+        if ((uint32_t)expert >= table->n_total_expert) {
             fprintf(stderr,
                     "ds4: CUDA streaming expert id %d is outside 0..%u at layer %u\n",
                     expert, table->n_total_expert, table->layer);
@@ -28917,6 +29400,16 @@ static int cuda_stream_selected_cache_begin_load(
         slot_ids[i] = compact;
     }
     if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;
+    if (allow_negative && getenv("DS4_CUDA_V41_EXPERT_SORTED_IO")) {
+        std::sort(compact_ids.begin(), compact_ids.end());
+        std::fill(expert_to_slot.begin(), expert_to_slot.end(), -1);
+        for (uint32_t i = 0; i < compact_ids.size(); i++)
+            expert_to_slot[(uint32_t)compact_ids[i]] = (int32_t)i;
+        for (uint32_t i = 0; i < slot_count; i++) {
+            const int32_t expert = selected_ids[i];
+            slot_ids[i] = expert < 0 ? -1 : expert_to_slot[(uint32_t)expert];
+        }
+    }
     const uint64_t compact_count = compact_ids.size();
     if (compact_count > UINT64_MAX / table->gate_expert_bytes ||
         compact_count > UINT64_MAX / table->down_expert_bytes) {
@@ -28976,33 +29469,43 @@ static int cuda_stream_selected_cache_begin_load(
         use_persistent_cache = 0;
     }
     if (!use_persistent_cache) {
-        for (uint32_t i = 0; i < compact_ids.size(); i++) {
-            const uint64_t expert = (uint32_t)compact_ids[i];
-            const uint64_t gate_src =
-                table->gate_offset + expert * table->gate_expert_bytes;
-            const uint64_t up_src =
-                table->up_offset + expert * table->gate_expert_bytes;
-            const uint64_t down_src =
-                table->down_offset + expert * table->down_expert_bytes;
-            const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
-            const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
-            if (!cuda_model_copy_to_device_streamed(
-                        g_stream_selected_cache.gate_ptr + gate_dst,
-                        table->model_map, table->model_size,
-                        gate_src, table->gate_expert_bytes,
-                        "stream gate expert copy") ||
-                !cuda_model_copy_to_device_streamed(
-                        g_stream_selected_cache.up_ptr + gate_dst,
-                        table->model_map, table->model_size,
-                        up_src, table->gate_expert_bytes,
-                        "stream up expert copy") ||
-                !cuda_model_copy_to_device_streamed(
-                        g_stream_selected_cache.down_ptr + down_dst,
-                        table->model_map, table->model_size,
-                        down_src, table->down_expert_bytes,
-                        "stream down expert copy")) {
-                cuda_stream_selected_cache_invalidate();
-                return 0;
+        int packed = 0;
+        if (getenv("DS4_CUDA_V41_EXPERT_PACKED_IO")) {
+            packed = cuda_stream_selected_load_packed_parallel(
+                table, compact_ids,
+                g_stream_selected_cache.gate_ptr,
+                g_stream_selected_cache.up_ptr,
+                g_stream_selected_cache.down_ptr);
+        }
+        if (!packed) {
+            for (uint32_t i = 0; i < compact_ids.size(); i++) {
+                const uint64_t expert = (uint32_t)compact_ids[i];
+                const uint64_t gate_src =
+                    table->gate_offset + expert * table->gate_expert_bytes;
+                const uint64_t up_src =
+                    table->up_offset + expert * table->gate_expert_bytes;
+                const uint64_t down_src =
+                    table->down_offset + expert * table->down_expert_bytes;
+                const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
+                const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
+                if (!cuda_model_copy_to_device_streamed(
+                            g_stream_selected_cache.gate_ptr + gate_dst,
+                            table->model_map, table->model_size,
+                            gate_src, table->gate_expert_bytes,
+                            "stream gate expert copy") ||
+                    !cuda_model_copy_to_device_streamed(
+                            g_stream_selected_cache.up_ptr + gate_dst,
+                            table->model_map, table->model_size,
+                            up_src, table->gate_expert_bytes,
+                            "stream up expert copy") ||
+                    !cuda_model_copy_to_device_streamed(
+                            g_stream_selected_cache.down_ptr + down_dst,
+                            table->model_map, table->model_size,
+                            down_src, table->down_expert_bytes,
+                            "stream down expert copy")) {
+                    cuda_stream_selected_cache_invalidate();
+                    return 0;
+                }
             }
         }
     }
@@ -34447,7 +34950,7 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                  "GLM streaming selected-id read")) {
         return 0;
     }
-    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected);
+    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected, 0);
 }
 
 __global__ static void glm_value_project_q8_0_batch_heads_kernel(
@@ -35077,7 +35580,15 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
     return cuda_stream_selected_cache_begin_load(table, selected_ids,
-                                                 n_selected);
+                                                 n_selected, 0);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_begin_selected_masked_load(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
+    return cuda_stream_selected_cache_begin_load(table, selected_ids,
+                                                 n_selected, 1);
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
@@ -35276,7 +35787,7 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         return 0;
     }
     return cuda_stream_selected_cache_begin_load(
-            table, selected_ids, n_tokens * n_selected);
+            table, selected_ids, n_tokens * n_selected, 0);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(

@@ -38650,7 +38650,7 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
 }
 
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
-static ds4_context_memory ds41_graph_memory(uint32_t ctx);
+static ds4_context_memory ds41_graph_memory(uint32_t ctx, uint32_t requested_chunk);
 #endif
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
@@ -38664,7 +38664,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     if (ds4_backend_uses_graph(backend)) {
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
-            return ds41_graph_memory(ctx);
+            return ds41_graph_memory(ctx, prefill_chunk);
 #endif
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
             const uint32_t work_ctx =
@@ -39114,11 +39114,19 @@ typedef struct {
 #undef DS41_ROW_FIELD
 } ds41_prefill_row;
 
-static uint32_t ds41_prefill_limit(uint32_t ctx) {
+static uint32_t ds41_prefill_limit(uint32_t ctx, uint32_t requested_chunk) {
 #ifndef __APPLE__
-    const uint32_t limit = DS4_TP_BATCH_MAX_ROWS;
+    /* DS4_TP_BATCH_MAX_ROWS is a session/TP exchange limit, not a CUDA
+     * single-session prefill limit. Reusing it here forced every V4.1
+     * low-VRAM prompt through 8-token layer sweeps even when the caller
+     * explicitly requested a wider --prefill-chunk. The layer-major V4.1
+     * kernels already have general batch fallbacks above the 8-row exact
+     * decode path, so size the graph from the requested prefill capacity. */
+    uint32_t limit = requested_chunk ? requested_chunk : DS4_TP_BATCH_MAX_ROWS;
+    if (limit > 2048u) limit = 2048u;
     return ctx < limit ? ctx : limit;
 #else
+    (void)requested_chunk;
     const uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
         (ctx < 16384u || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ? 4096u : DS41_PREFILL_CAP;
     return ctx < limit ? ctx : limit;
@@ -39130,7 +39138,7 @@ static uint32_t ds41_carry_words(uint32_t width, uint32_t format, bool compact) 
     return format == DS4_V41_CARRY_BF16 ? (width + 1u) / 2u : (width + 31u) / 32u;
 }
 
-static uint32_t ds41_carry_cap(uint32_t ctx) {
+static uint32_t ds41_carry_cap(uint32_t ctx, uint32_t requested_chunk) {
     const bool compact = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY");
     const uint64_t row_bytes = ((uint64_t)ds41_carry_words(DS4_N_HC * DS4_N_EMBD,
         DS4_V41_CARRY_BF16, compact) + DS4_N_HC + 24u + DS4_N_INDEXER_TOP_K +
@@ -39138,7 +39146,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     uint64_t cap = (UINT64_C(3) << 30) / row_bytes;
     if (cap > 32768u) cap = 32768u;
     if (cap > ctx) cap = ctx;
-    const uint32_t chunk = ds41_prefill_limit(ctx);
+    const uint32_t chunk = ds41_prefill_limit(ctx, requested_chunk);
     if (!chunk) return 0;
     /* Keep the causal sweep boundary independent of the encoder tile size. */
     cap -= cap % 2048u;
@@ -39246,10 +39254,10 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     g->table[0].fd = g->table[1].fd = -1;
 }
 
-static uint64_t ds41_graph_bytes(uint32_t ctx) {
+static uint64_t ds41_graph_bytes(uint32_t ctx, uint32_t requested_chunk) {
     const ds41_gpu_graph shape = {.ctx = ctx,
-        .prefill_cap = ds41_prefill_limit(ctx),
-        .carry_cap = ds41_carry_cap(ctx),
+        .prefill_cap = ds41_prefill_limit(ctx, requested_chunk),
+        .carry_cap = ds41_carry_cap(ctx, requested_chunk),
         .prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS"),
         .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")}, *g = &shape;
     uint64_t floats = (uint64_t)40 * 128 * 512;
@@ -39279,14 +39287,14 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     return floats * sizeof(float) + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u + packed + sort;
 }
 
-static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
-    ds4_context_memory m = {.prefill_cap = ds41_prefill_limit(ctx),
+static ds4_context_memory ds41_graph_memory(uint32_t ctx, uint32_t requested_chunk) {
+    ds4_context_memory m = {.prefill_cap = ds41_prefill_limit(ctx, requested_chunk),
                            .raw_cap = 128, .comp_cap = ctx + 1u};
     m.raw_bytes = 40u * 128u * 512u * sizeof(float);
     for (uint32_t i = 0; i < 4; i++)
         m.compressed_bytes += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) *
                               (512u + 128u) * sizeof(float);
-    m.total_bytes = ds41_graph_bytes(ctx);
+    m.total_bytes = ds41_graph_bytes(ctx, requested_chunk);
     m.scratch_bytes = m.total_bytes - m.raw_bytes - m.compressed_bytes;
     return m;
 }
@@ -39301,16 +39309,16 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
 
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
                                               const ds4_weights *w, const char *path,
-                                              uint32_t ctx, bool streaming) {
+                                              uint32_t ctx, bool streaming, uint32_t requested_chunk) {
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
     if (!ctx || ctx > 1048576 || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return false;
     g->ctx = ctx;
-    g->prefill_cap = ds41_prefill_limit(ctx);
-    g->carry_cap = ds41_carry_cap(ctx);
+    g->prefill_cap = ds41_prefill_limit(ctx, requested_chunk);
+    g->carry_cap = ds41_carry_cap(ctx, requested_chunk);
     g->compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY");
     g->prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS");
-    g->allocation_bytes = ds41_graph_bytes(ctx);
+    g->allocation_bytes = ds41_graph_bytes(ctx, requested_chunk);
     g->streaming = streaming;
     g->tp_world = 1;
     g->token_map = malloc((size_t)DS4_N_VOCAB * sizeof(uint32_t));
@@ -39405,7 +39413,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
 #undef DS41_CARRY_ALLOC
     ds41_graph_reset(g);
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
-            (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
+            (double)ds41_graph_bytes(ctx, requested_chunk) / 1048576.0, ctx);
     return true;
 fail:
     ds41_graph_free(g);
@@ -40081,6 +40089,33 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             (n_raw - kept + part) * row_bytes, (kept - part) * row_bytes));
 }
 
+static bool ds41_hc_batch_range(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_layer_weights *l, uint32_t il,
+                                 uint32_t first, uint32_t count, bool before) {
+    if (!g || !count || g->image_count || first > g->prefill_cap ||
+        count > g->prefill_cap - first) return false;
+    ds41_gpu_graph view = *g;
+    ds41_prefill_row b = {0};
+    bool ok = true;
+#define DS41_HC_VIEW(field, width) do { \
+        if (ok) b.field = ds4_gpu_tensor_view(g->batch.field, \
+            (uint64_t)first * (width) * sizeof(float), \
+            (uint64_t)count * (width) * sizeof(float)); \
+        if (ok && !b.field) ok = false; \
+    } while (0);
+    DS41_PREFILL_ROWS(DS41_HC_VIEW)
+#undef DS41_HC_VIEW
+    if (ok) {
+        view.pos = g->pos + first;
+        ok = before ? ds41_before_attention_batch(&view, &b, m, l, il, count) :
+                      ds41_after_attention_batch(&b, m, l, count);
+    }
+#define DS41_HC_FREE(field, width) ds4_gpu_tensor_free(b.field);
+    DS41_PREFILL_ROWS(DS41_HC_FREE)
+#undef DS41_HC_FREE
+    return ok;
+}
+
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
     return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
@@ -40129,24 +40164,12 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
-static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
-                           const ds4_layer_weights *l, uint32_t il, uint32_t count,
-                           bool shared_owner) {
-    CED_RANGE("moe_batch layer=%u pos=%u rows=%u", il, g->pos, count);
-    ds41_prefill_row *b = &g->batch;
+static bool ds41_routed_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il,
+                                  ds41_prefill_row *b, uint32_t count) {
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
-    if (!(ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
-        ds41_route_batch(g, m, l, count) &&
-        ((shared_owner && g->tp_rank != (il & 1u)) ||
-        (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
-        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
-        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
-            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
-        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
-        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true)))))
-        return false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (g->streaming) {
         const uint64_t slots = (uint64_t)count * DS4_N_EXPERT_USED;
@@ -40155,9 +40178,6 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         if (!selected_ids) return false;
         const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(
             m, l, il, gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD);
-        /* Read every token's route before MMQ resolves weights. The loader
-         * owns the compact remap/upload staging after it returns; selected
-         * keeps its original IDs, and routed MoE waits for the ready event. */
         const bool loaded = ds4_gpu_tensor_read(b->selected, 0, selected_ids,
                 slots * sizeof(*selected_ids)) &&
             ds4_gpu_stream_expert_cache_begin_selected_load(
@@ -40172,10 +40192,226 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
-            il, count, &mid_f16, true) &&
-        (!shared_owner || g->tp_rank != (il & 1u) ||
-            ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
-        ds41_sum_partial_batch(g, b->routed, il, count);
+            il, count, &mid_f16, true) != 0;
+}
+
+static bool ds41_routed_moe_batch_range(ds41_gpu_graph *g, const ds4_model *m,
+                                        const ds4_layer_weights *l, uint32_t il,
+                                        uint32_t first, uint32_t count) {
+    if (!g || !count || first > g->prefill_cap || count > g->prefill_cap - first)
+        return false;
+    ds41_prefill_row b = {0};
+    bool ok = true;
+#define DS41_ROUTED_VIEW(field, width) do { \
+        if (ok) b.field = ds4_gpu_tensor_view(g->batch.field, \
+            (uint64_t)first * (width) * sizeof(float), \
+            (uint64_t)count * (width) * sizeof(float)); \
+        if (ok && !b.field) ok = false; \
+    } while (0);
+    DS41_ROUTED_VIEW(norm, DS4_N_EMBD)
+    DS41_ROUTED_VIEW(selected, DS4_N_EXPERT_USED)
+    DS41_ROUTED_VIEW(route_weights, DS4_N_EXPERT_USED)
+    DS41_ROUTED_VIEW(gate, DS4_N_EXPERT_USED * DS4_N_FF_EXP)
+    DS41_ROUTED_VIEW(up, DS4_N_EXPERT_USED * DS4_N_FF_EXP)
+    DS41_ROUTED_VIEW(mid, DS4_N_EXPERT_USED * DS4_N_FF_EXP)
+    DS41_ROUTED_VIEW(experts, DS4_N_EXPERT_USED * DS4_N_EMBD)
+    DS41_ROUTED_VIEW(routed, DS4_N_EMBD)
+#undef DS41_ROUTED_VIEW
+    if (ok) ok = ds41_routed_moe_batch(g, m, l, il, &b, count);
+#define DS41_ROUTED_FREE(field) ds4_gpu_tensor_free(b.field)
+    DS41_ROUTED_FREE(norm); DS41_ROUTED_FREE(selected); DS41_ROUTED_FREE(route_weights);
+    DS41_ROUTED_FREE(gate); DS41_ROUTED_FREE(up); DS41_ROUTED_FREE(mid);
+    DS41_ROUTED_FREE(experts); DS41_ROUTED_FREE(routed);
+#undef DS41_ROUTED_FREE
+    return ok;
+}
+
+static bool ds41_routed_moe_batch_windows(ds41_gpu_graph *g, const ds4_model *m,
+                                           const ds4_layer_weights *l, uint32_t il,
+                                           ds41_prefill_row *b, uint32_t count) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    (void)g; (void)m; (void)l; (void)il; (void)b; (void)count;
+    return false;
+#else
+    const uint64_t slots = (uint64_t)count * DS4_N_EXPERT_USED;
+    const uint64_t down_elems = slots * DS4_N_EMBD;
+    if (!g || !m || !l || !b || !count || !slots || slots > UINT32_MAX ||
+        slots > SIZE_MAX / sizeof(int32_t)) return false;
+    int32_t *ids = malloc((size_t)slots * sizeof(*ids));
+    int32_t *masked = malloc((size_t)slots * sizeof(*masked));
+    if (!ids || !masked) { free(masked); free(ids); return false; }
+    bool seen[DS4_MAX_EXPERT] = {0};
+    uint32_t unique[DS4_MAX_EXPERT];
+    uint32_t n_unique = 0;
+    bool ok = ds4_gpu_tensor_read(b->selected, 0, ids,
+                                  slots * sizeof(*ids)) != 0;
+    for (uint64_t i = 0; ok && i < slots; i++) {
+        const int32_t id = ids[i];
+        if (id < 0 || (uint32_t)id >= DS4_N_EXPERT ||
+            (uint32_t)id >= DS4_MAX_EXPERT) {
+            ok = false;
+            break;
+        }
+        if (!seen[(uint32_t)id]) {
+            seen[(uint32_t)id] = true;
+            unique[n_unique++] = (uint32_t)id;
+        }
+    }
+    /* Stable ascending order improves file locality and makes runs comparable;
+     * slot order is preserved separately in `masked` and in the final sum. */
+    for (uint32_t i = 1; ok && i < n_unique; i++) {
+        const uint32_t v = unique[i];
+        uint32_t j = i;
+        while (j && unique[j - 1u] > v) {
+            unique[j] = unique[j - 1u];
+            j--;
+        }
+        unique[j] = v;
+    }
+    uint32_t target = 24u;
+    const char *window_env = getenv("DS4_CUDA_V41_EXPERT_WINDOW");
+    if (window_env && window_env[0]) {
+        char *end = NULL;
+        const unsigned long v = strtoul(window_env, &end, 10);
+        if (end != window_env && *end == '\0') target = (uint32_t)v;
+    }
+    if (target < DS4_N_EXPERT_USED) target = DS4_N_EXPERT_USED;
+    if (target > 48u) target = 48u;
+    const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(
+        m, l, il, gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD);
+    if (ok) ok = n_unique >= DS4_N_EXPERT_USED &&
+                 ds4_gpu_tensor_fill_f32(b->experts, 0, down_elems) != 0;
+    uint32_t windows = 0;
+    for (uint32_t first = 0; ok && first < n_unique;) {
+        const uint32_t remain = n_unique - first;
+        uint32_t take = remain < target ? remain : target;
+        if (remain > take && remain - take < DS4_N_EXPERT_USED) take = remain;
+        bool allowed[DS4_MAX_EXPERT] = {0};
+        for (uint32_t j = 0; j < take; j++) allowed[unique[first + j]] = true;
+        for (uint64_t i = 0; i < slots; i++)
+            masked[i] = allowed[(uint32_t)ids[i]] ? ids[i] : -1;
+        ok = ds4_gpu_stream_expert_cache_begin_selected_masked_load(
+                 &table, masked, (uint32_t)slots) != 0;
+        /* Keep the exact 8-row MMQ shape used by the validated reference.
+         * Only expert residency is widened: each window stays loaded while all
+         * token tiles consume it. Each valid result lands in its original
+         * [token, router-slot] position in `experts`. */
+        for (uint32_t off = 0; ok && off < count; off += DS4_TP_BATCH_MAX_ROWS) {
+            const uint32_t rows = count - off < DS4_TP_BATCH_MAX_ROWS ?
+                count - off : DS4_TP_BATCH_MAX_ROWS;
+            if (rows == 1u) { ok = false; break; }
+            ds4_gpu_tensor *norm = ds4_gpu_tensor_view(
+                b->norm, (uint64_t)off * DS4_N_EMBD * sizeof(float),
+                (uint64_t)rows * DS4_N_EMBD * sizeof(float));
+            ds4_gpu_tensor *weights = ds4_gpu_tensor_view(
+                b->route_weights,
+                (uint64_t)off * DS4_N_EXPERT_USED * sizeof(float),
+                (uint64_t)rows * DS4_N_EXPERT_USED * sizeof(float));
+            ds4_gpu_tensor *gate = ds4_gpu_tensor_view(
+                b->gate,
+                (uint64_t)off * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float),
+                (uint64_t)rows * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+            ds4_gpu_tensor *up = ds4_gpu_tensor_view(
+                b->up,
+                (uint64_t)off * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float),
+                (uint64_t)rows * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+            ds4_gpu_tensor *mid = ds4_gpu_tensor_view(
+                b->mid,
+                (uint64_t)off * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float),
+                (uint64_t)rows * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+            ds4_gpu_tensor *down = ds4_gpu_tensor_view(
+                b->experts,
+                (uint64_t)off * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float),
+                (uint64_t)rows * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+            ok = norm && weights && gate && up && mid && down &&
+                 ds4_gpu_routed_moe_iq2_cached_slice_tensor(
+                     gate, up, mid, down, weights, norm,
+                     DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                     DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                     DS4_SWIGLU_CLAMP_EXP, il,
+                     off * DS4_N_EXPERT_USED, rows) != 0;
+            ds4_gpu_tensor_free(down);
+            ds4_gpu_tensor_free(mid);
+            ds4_gpu_tensor_free(up);
+            ds4_gpu_tensor_free(gate);
+            ds4_gpu_tensor_free(weights);
+            ds4_gpu_tensor_free(norm);
+        }
+        first += take;
+        windows++;
+    }
+    if (ok) ok = ds4_gpu_routed_moe_sum_slots_tensor(
+        b->routed, b->experts, DS4_N_EMBD, DS4_N_EXPERT_USED, count) != 0;
+    if (getenv("DS4_CUDA_V41_EXPERT_WINDOW_PROFILE"))
+        fprintf(stderr,
+                "ds4: V4.1 MMQ expert windows layer=%u rows=%u unique=%u windows=%u target=%u ok=%d\n",
+                il, count, n_unique, windows, target, ok ? 1 : 0);
+    free(masked);
+    free(ids);
+    return ok;
+#endif
+}
+
+static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
+                           const ds4_layer_weights *l, uint32_t il, uint32_t count,
+                           bool shared_owner) {
+    CED_RANGE("moe_batch layer=%u pos=%u rows=%u", il, g->pos, count);
+    ds41_prefill_row *b = &g->batch;
+    if (!(ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+        ds41_route_batch(g, m, l, count) &&
+        ((shared_owner && g->tp_rank != (il & 1u)) ||
+        (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
+        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
+        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true)))))
+        return false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (g->streaming && count > DS4_TP_BATCH_MAX_ROWS) {
+        if (getenv("DS4_CUDA_V41_ROUTE_PROFILE")) {
+            const uint64_t slots = (uint64_t)count * DS4_N_EXPERT_USED;
+            int32_t *ids = malloc((size_t)slots * sizeof(*ids));
+            if (!ids) return false;
+            bool seen[DS4_MAX_EXPERT] = {0};
+            uint32_t unique = 0;
+            const bool read = ds4_gpu_tensor_read(b->selected, 0, ids,
+                                                   slots * sizeof(*ids)) != 0;
+            if (read) {
+                for (uint64_t i = 0; i < slots; i++) {
+                    const int32_t id = ids[i];
+                    if (id >= 0 && (uint32_t)id < DS4_N_EXPERT && !seen[id]) {
+                        seen[id] = true;
+                        unique++;
+                    }
+                }
+                fprintf(stderr,
+                    "ds4: V4.1 route profile layer=%u rows=%u slots=%llu unique=%u\n",
+                    il, count, (unsigned long long)slots, unique);
+            }
+            free(ids);
+            if (!read) return false;
+        }
+        if (getenv("DS4_CUDA_V41_EXPERT_WINDOWS") &&
+            count % DS4_TP_BATCH_MAX_ROWS != 1u) {
+            if (!ds41_routed_moe_batch_windows(g, m, l, il, b, count)) return false;
+        } else {
+            for (uint32_t off = 0; off < count; off += DS4_TP_BATCH_MAX_ROWS) {
+                const uint32_t rows = count - off < DS4_TP_BATCH_MAX_ROWS ?
+                    count - off : DS4_TP_BATCH_MAX_ROWS;
+                if (!ds41_routed_moe_batch_range(g, m, l, il, off, rows)) return false;
+            }
+        }
+    } else
+#endif
+    if (!ds41_routed_moe_batch(g, m, l, il, b, count)) return false;
+    if (shared_owner && g->tp_rank == (il & 1u)) {
+        if (!ds4_gpu_add_tensor(b->routed, b->routed, b->shared,
+                                count * DS4_N_EMBD)) return false;
+    }
+    return ds41_sum_partial_batch(g, b->routed, il, count);
 }
 
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
@@ -40582,9 +40818,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    /* CUDA loads routed weights from the selected IDs in ds41_moe_batch.
-     * Preparing whole expert tables here duplicates those SSD reads. */
-    const bool prepare_decode_only = g->streaming && batch_moe && g->tp_world == 1;
+    /* CUDA low-VRAM loads routed weights from selected IDs in both the
+     * scalar and batched MoE paths. Preparing whole expert tables here not
+     * only duplicates those SSD reads, it can require several GiB of VRAM
+     * when batch MoE is disabled for a prefill fallback. */
+    const bool prepare_decode_only = g->streaming && g->tp_world == 1;
 #else
     const bool prepare_decode_only = false;
 #endif
@@ -40740,8 +40978,21 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds4_gpu_tensor_copy(g->batch.engram_rows, 0, g->engram_prefetch,
                                          off * bytes, count * bytes) != 0;
             }
-            if (ok && batch_hc)
-                ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
+            if (ok && batch_hc) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+                if (g->streaming && !g->image_count && count > DS4_TP_BATCH_MAX_ROWS) {
+                    for (uint32_t hoff = 0; ok && hoff < count; hoff += DS4_TP_BATCH_MAX_ROWS) {
+                        const uint32_t hcount = count - hoff < DS4_TP_BATCH_MAX_ROWS ?
+                            count - hoff : DS4_TP_BATCH_MAX_ROWS;
+                        ok = ds41_hc_batch_range(g, m, &w->layer[il], il,
+                                                  hoff, hcount, true);
+                    }
+                } else
+#endif
+                {
+                    ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
+                }
+            }
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -40786,7 +41037,20 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                                    g->batch.low, count, true);
                 }
                 DS41_STAGE("attention output");
-                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count);
+                if (ok && batch_hc) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+                    if (g->streaming && !g->image_count && count > DS4_TP_BATCH_MAX_ROWS) {
+                        for (uint32_t hoff = 0; ok && hoff < count; hoff += DS4_TP_BATCH_MAX_ROWS) {
+                            const uint32_t hcount = count - hoff < DS4_TP_BATCH_MAX_ROWS ?
+                                count - hoff : DS4_TP_BATCH_MAX_ROWS;
+                            ok = ds41_hc_batch_range(g, m, l, il, hoff, hcount, false);
+                        }
+                    } else
+#endif
+                    {
+                        ok = ds41_after_attention_batch(&active, m, l, count);
+                    }
+                }
                 DS41_STAGE("hc/ffn norm");
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                     row.pos = start + t;
@@ -40794,12 +41058,19 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     DS41_PREFILL_ROWS(DS41_USE_FFN_ROW)
 #undef DS41_USE_FFN_ROW
                     ok = ds41_graph_after_attention(&row, m, l);
-                    if (ok && !batch_moe) ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t]) &&
-                        ds41_graph_after_moe(&row);
+                    if (ok && !batch_moe) {
+                        /* The row view keeps dense weights on the already-mapped
+                         * layer, but scalar MoE still needs low-VRAM selected-
+                         * expert streaming. Only expose streaming for this call. */
+                        row.streaming = g->streaming;
+                        ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t]) &&
+                             ds41_graph_after_moe(&row);
+                        row.streaming = false;
+                    }
                 }
             }
             if (ok && batch_moe) {
-                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
+ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
@@ -60316,10 +60587,11 @@ static int ds4_engine_collect_sequential_imatrix(
         if (ctx_size > 1048576 ||
 #ifdef __APPLE__
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
-                ds41_graph_bytes((uint32_t)ctx_size)), false) ||
+                ds41_graph_bytes((uint32_t)ctx_size, e->prefill_chunk)), false) ||
 #endif
             !ds41_graph_alloc(&d, &e->model, &e->weights, e->model_path,
-                              (uint32_t)ctx_size, e->ssd_streaming)) return 1;
+                              (uint32_t)ctx_size, e->ssd_streaming,
+                              e->prefill_chunk)) return 1;
     } else
 #endif
     if (!glm_graph_alloc(&g, &e->model, &e->weights, ctx_size,
@@ -65979,7 +66251,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
         const uint32_t sessions = e->placement_session_count_hint > 0 ?
             (uint32_t)e->placement_session_count_hint : 1;
-        if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+        if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx, e->prefill_chunk), sessions), true)) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -66403,7 +66675,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
             const uint32_t sessions = e->placement_session_count_hint > 0 ?
                 (uint32_t)e->placement_session_count_hint : 1;
-            if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+            if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx, e->prefill_chunk), sessions), true)) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -67789,10 +68061,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         if (ctx_size > 1048576 ||
 #ifdef __APPLE__
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
-                ds41_graph_bytes((uint32_t)ctx_size)), false) ||
+                ds41_graph_bytes((uint32_t)ctx_size, e->prefill_chunk)), false) ||
 #endif
             !ds41_graph_alloc(&s->ds41_graph, &e->model, &e->weights,
-                              e->model_path, (uint32_t)ctx_size, e->ssd_streaming)) {
+                              e->model_path, (uint32_t)ctx_size, e->ssd_streaming,
+                              e->prefill_chunk)) {
             free(s);
             return 1;
         }

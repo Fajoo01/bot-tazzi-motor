@@ -389,6 +389,10 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+int ds4_gpu_stream_expert_cache_begin_selected_masked_load(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected);
 int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
@@ -2771,6 +2775,17 @@ int ds4_gpu_routed_moe_one_owned_tensor(
         ds4_gpu_tensor       *down_output,
         bool                  pack_fixed3,
         ds4_gpu_tensor       *shared_prequant);
+
+int ds4_gpu_routed_moe_sum_slots_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *down,
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens);
+int ds4_gpu_routed_moe_iq2_cached_slice_tensor(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *x,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        uint32_t layer_index, uint32_t slot_offset, uint32_t n_tokens);
 
 int ds4_gpu_routed_moe_batch_owned_tensor(
         ds4_gpu_tensor       *out,
