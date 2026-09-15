@@ -114,3 +114,16 @@ These are recorded so the same dead ends do not need to be rediscovered:
 The fast path is opt-in through environment variables and falls back to the ordinary loader when the companion pack is unavailable. The benchmark watchdog checks that production stays alive, port 19194 remains present, the model file is unchanged, and Dirty/Writeback growth stays bounded.
 
 This branch is experimental and tuned to one constrained machine. Results on other GPUs, storage devices or V4.1 GGUF layouts should be revalidated rather than assumed.
+
+## Reproducible sidecar benchmark
+
+Local benchmark output is intentionally kept out of Git. Use the public helper instead:
+
+```sh
+python3 tools/bottazzi-motor/benchmark_sidecar.py stable-prefill \
+  --model /path/to/DeepSeek-V4.1-Flash-Q2.gguf \
+  --pack /fast/nvme/Bot-tazzi-Motor-v41-experts.pack \
+  --mode prefill --prefill-chunk 180
+```
+
+For sustained decode validation, use `--mode decode --tokens 16`. The helper launches only the isolated sidecar, requires the production listener on port 19194 by default, records request/response/server log under `.bottazzi-validation/`, verifies that the model metadata is unchanged, and removes the sidecar when the run ends. Set `--production-port 0` only on machines with no production service.

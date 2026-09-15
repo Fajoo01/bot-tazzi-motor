@@ -66,3 +66,12 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+
+# Bot-tazzi Motor local experiment artefacts
+/.ced-validation/*
+!/.ced-validation/ced-profile.h
+/.codex-validation/
+/.bottazzi-validation/
+*.rej
+/tests/test_v41_cuda_primitives
+/tools/bottazzi-motor/build_expert_pack
