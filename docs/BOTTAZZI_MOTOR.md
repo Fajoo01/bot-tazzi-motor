@@ -127,3 +127,43 @@ python3 tools/bottazzi-motor/benchmark_sidecar.py stable-prefill \
 ```
 
 For sustained decode validation, use `--mode decode --tokens 16`. The helper launches only the isolated sidecar, requires the production listener on port 19194 by default, records request/response/server log under `.bottazzi-validation/`, verifies that the model metadata is unchanged, and removes the sidecar when the run ends. Set `--production-port 0` only on machines with no production service.
+
+## Experimental predictive route prefetch
+
+Bot-tazzi Motor can optionally learn cross-layer MoE routing transitions from diagnostic route traces and prefetch likely future expert frames. The predictor never changes router output, expert selection, logits, or model weights: a miss falls back to the normal O_DIRECT loader.
+
+Enable route tracing only for isolated diagnostic runs:
+
+```sh
+export DS4_CUDA_V41_ROUTE_TRACE=/tmp/route.csv
+```
+
+Train a horizon-2 transition model from several independent traces:
+
+```sh
+python3 tools/bottazzi-motor/train_route_predictor.py \
+  --route trace-a.csv --route trace-b.csv --route trace-c.csv \
+  --horizon 2 --output route-transition-h2.bin
+```
+
+The trainer intentionally does not include or publish the private prompts used to produce local traces. NumPy is required only for training, not for inference.
+Run inference with the predictor as an opt-in experiment:
+
+```sh
+export DS4_CUDA_V41_ROUTE_PREFETCH=1
+export DS4_CUDA_V41_ROUTE_PREDICTOR=/path/to/route-transition-h2.bin
+export DS4_CUDA_V41_ROUTE_PREFETCH_BUDGET=16
+```
+
+On the tested RTX 2070 while production remained resident on the same GPU, a 146-token Judge-style OOD prompt at `prefill_chunk=96` gave two clean baseline prefills of 43.481 s and 43.324 s, versus 42.932 s and 42.883 s with horizon-2/B16 prefetch: about 1.14% lower mean prefill latency. The rolling cache used about 303.75 MiB pinned host memory and served about 4.6 GiB of expert frames per run.
+
+Larger budgets were not safe defaults on this constrained shared-GPU setup: B20 (~379.69 MiB rolling cache) and cleaned B24 (~455.62 MiB) could trigger CUDA OOM at the normal 512 MiB reserve. Increasing the reserve to 640-768 MiB restored stability but removed nearly all measured speedup by shrinking the persistent model cache. Therefore predictive prefetch remains experimental and disabled by default.
+
+For Judge/process workloads, benchmark with an exact OpenAI-compatible request rather than the built-in synthetic prompt:
+
+```sh
+python3 tools/bottazzi-motor/benchmark_sidecar.py judge-ab \
+  --model /path/to/model.gguf --pack /fast/nvme/experts.pack \
+  --request-json judge-request.json --prefill-chunk 96 \
+  --stage-mb 640 --reserve-mb 512 --expert-window 32
+```

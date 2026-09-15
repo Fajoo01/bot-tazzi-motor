@@ -52,9 +52,14 @@ def main():
     ap.add_argument("--pack", required=True, type=Path)
     ap.add_argument("--mode", choices=("prefill", "decode"), default="prefill")
     ap.add_argument("--tokens", type=int)
+    ap.add_argument("--request-json", type=Path,
+                    help="use an OpenAI-compatible request JSON instead of the built-in prompt")
     ap.add_argument("--prefill-chunk", type=int, default=180)
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--stage-mb", type=int, default=640)
+    ap.add_argument("--reserve-mb", type=int, default=512)
+    ap.add_argument("--expert-window", type=int, default=32)
     ap.add_argument("--port", type=int, default=19196)
     ap.add_argument("--production-port", type=int, default=19194,
                     help="set to 0 to disable the production-listener guard")
@@ -74,18 +79,28 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     before = model_stat(a.model)
     max_tokens = a.tokens if a.tokens is not None else (1 if a.mode == "prefill" else 16)
-    prompt = PROMPT_OK if a.mode == "prefill" else PROMPT_DECODE
-    request = {"model": "deepseek-v4.1-flash",
-               "messages": [{"role": "user", "content": prompt}],
-               "stream": False, "think": False,
-               "max_tokens": max_tokens, "temperature": 0}
+    if a.request_json:
+        request = json.loads(a.request_json.read_text())
+        if not isinstance(request, dict) or not isinstance(request.get("messages"), list):
+            ap.error("--request-json must contain an object with a messages array")
+        request["stream"] = False
+        request.setdefault("think", False)
+        request.setdefault("temperature", 0)
+        request["max_tokens"] = max_tokens
+        request.setdefault("model", "deepseek-v4.1-flash")
+    else:
+        prompt = PROMPT_OK if a.mode == "prefill" else PROMPT_DECODE
+        request = {"model": "deepseek-v4.1-flash",
+                   "messages": [{"role": "user", "content": prompt}],
+                   "stream": False, "think": False,
+                   "max_tokens": max_tokens, "temperature": 0}
     (out / "request.json").write_text(json.dumps(request, indent=2))
 
     env = dict(os.environ)
     env.update({
         "DS4_LOCK_FILE": str(out / "sidecar.lock"),
-        "DS4_CUDA_LOW_VRAM_STAGE_MB": "640",
-        "DS4_CUDA_LOW_VRAM_RESERVE_MB": "512",
+        "DS4_CUDA_LOW_VRAM_STAGE_MB": str(a.stage_mb),
+        "DS4_CUDA_LOW_VRAM_RESERVE_MB": str(a.reserve_mb),
         "DS4_CUDA_V41_SMALL_PREFILL": "1",
         "DS4_CUDA_LOW_VRAM_DENSE_READAHEAD": "1",
         "DS4_CUDA_LOW_VRAM_HOST_CACHE_GB": "6",
@@ -93,7 +108,7 @@ def main():
         "DS4_CUDA_HOST_EXPERT_CHUNK_CACHE_GB": "16",
         "DS4_CUDA_HOST_EXPERT_CHUNK_CACHE_PINNED": "1",
         "DS4_CUDA_V41_EXPERT_WINDOWS": "1",
-        "DS4_CUDA_V41_EXPERT_WINDOW": "32",
+        "DS4_CUDA_V41_EXPERT_WINDOW": str(a.expert_window),
         "DS4_CUDA_V41_EXPERT_PACKED_IO": "1",
         "DS4_CUDA_V41_EXPERT_SORTED_IO": "1",
         "DS4_CUDA_V41_EXPERT_FRAME_DIRECT": "1",

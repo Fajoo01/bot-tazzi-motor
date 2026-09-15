@@ -40226,7 +40226,68 @@ static bool ds41_routed_moe_batch_range(ds41_gpu_graph *g, const ds4_model *m,
     return ok;
 }
 
+typedef struct {
+    int tried, ok;
+    uint32_t horizon, layers, experts;
+    float *matrix;
+} ds41_route_predictor;
+static ds41_route_predictor g_ds41_route_predictor;
+
+static bool ds41_route_predictor_load(void) {
+    if (g_ds41_route_predictor.tried) return g_ds41_route_predictor.ok != 0;
+    g_ds41_route_predictor.tried = 1;
+    const char *path = getenv("DS4_CUDA_V41_ROUTE_PREDICTOR");
+    if (!path || !path[0]) return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    unsigned char magic[8]; uint32_t h[4];
+    bool ok = fread(magic, 1, 8, fp) == 8 &&
+        fread(h, sizeof(uint32_t), 4, fp) == 4 &&
+        memcmp(magic, "BTMTRN1\0", 8) == 0 && h[0] == 1u &&
+        h[1] > 0u && h[2] <= DS4_N_LAYER && h[3] == DS4_N_EXPERT;
+    const uint64_t n = ok ? (uint64_t)h[2] * h[3] * h[3] : 0;
+    float *matrix = ok && n <= SIZE_MAX / sizeof(float) ?
+        malloc((size_t)n * sizeof(float)) : NULL;
+    if (!matrix || fread(matrix, sizeof(float), (size_t)n, fp) != n) ok = false;
+    fclose(fp);
+    if (!ok) { free(matrix); return false; }
+    g_ds41_route_predictor.horizon = h[1];
+    g_ds41_route_predictor.layers = h[2];
+    g_ds41_route_predictor.experts = h[3];
+    g_ds41_route_predictor.matrix = matrix;
+    g_ds41_route_predictor.ok = 1;
+    fprintf(stderr, "ds4: V4.1 route predictor loaded horizon=%u layers=%u experts=%u\n",
+            h[1], h[2], h[3]);
+    return true;
+}
+
+static uint32_t ds41_route_predict_top(uint32_t il, const int32_t *ids,
+        uint64_t slots, int32_t *out, uint32_t budget) {
+    if (!ids || !out || !budget || !ds41_route_predictor_load() ||
+        il >= g_ds41_route_predictor.layers) return 0;
+    float freq[DS4_MAX_EXPERT] = {0};
+    float score[DS4_MAX_EXPERT] = {0};
+    bool used[DS4_MAX_EXPERT] = {0};
+    for (uint64_t i = 0; i < slots; i++)
+        if (ids[i] >= 0 && (uint32_t)ids[i] < DS4_N_EXPERT) freq[(uint32_t)ids[i]] += 1.0f;
+    const uint32_t n = g_ds41_route_predictor.experts;
+    const float *m = g_ds41_route_predictor.matrix + (uint64_t)il * n * n;
+    for (uint32_t x = 0; x < n; x++) if (freq[x] != 0.0f)
+        for (uint32_t y = 0; y < n; y++) score[y] += freq[x] * m[(uint64_t)x * n + y];
+    if (budget > n) budget = n;
+    uint32_t got = 0;
+    for (; got < budget; got++) {
+        uint32_t best = UINT32_MAX; float best_score = -INFINITY;
+        for (uint32_t y = 0; y < n; y++)
+            if (!used[y] && score[y] > best_score) { best = y; best_score = score[y]; }
+        if (best == UINT32_MAX) break;
+        used[best] = true; out[got] = (int32_t)best;
+    }
+    return got;
+}
+
 static bool ds41_routed_moe_batch_windows(ds41_gpu_graph *g, const ds4_model *m,
+                                           const ds4_weights *w,
                                            const ds4_layer_weights *l, uint32_t il,
                                            ds41_prefill_row *b, uint32_t count) {
 #if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
@@ -40344,6 +40405,30 @@ static bool ds41_routed_moe_batch_windows(ds41_gpu_graph *g, const ds4_model *m,
     }
     if (ok) ok = ds4_gpu_routed_moe_sum_slots_tensor(
         b->routed, b->experts, DS4_N_EMBD, DS4_N_EXPERT_USED, count) != 0;
+    if (ok && w && getenv("DS4_CUDA_V41_ROUTE_PREFETCH")) {
+        uint32_t budget = 16u;
+        const char *budget_env = getenv("DS4_CUDA_V41_ROUTE_PREFETCH_BUDGET");
+        if (budget_env && budget_env[0]) {
+            char *end = NULL; const unsigned long v = strtoul(budget_env, &end, 10);
+            if (end != budget_env && *end == '\0' && v >= 1u && v <= 64u) budget = (uint32_t)v;
+        }
+        int32_t predicted[64];
+        const uint32_t n_pred = ds41_route_predict_top(il, ids, slots, predicted, budget);
+        if (n_pred && il + g_ds41_route_predictor.horizon < DS4_N_LAYER) {
+            const uint32_t future_il = il + g_ds41_route_predictor.horizon;
+            const ds4_layer_weights *future = &w->layer[future_il];
+            const uint64_t future_gate_row = routed_expert_row_bytes(future->ffn_gate_exps);
+            const uint64_t future_down_row = routed_expert_row_bytes(future->ffn_down_exps);
+            const ds4_gpu_stream_expert_table future_table = graph_stream_expert_table_make(
+                m, future, future_il, future_gate_row * DS4_N_FF_EXP,
+                future_down_row * DS4_N_EMBD);
+            const int started = ds4_gpu_v41_expert_frame_prefetch_start(
+                &future_table, predicted, n_pred);
+            if (getenv("DS4_CUDA_V41_ROUTE_PREFETCH_PROFILE"))
+                fprintf(stderr, "ds4: V4.1 route prefetch layer=%u future=%u predicted=%u started=%d\n",
+                        il, future_il, n_pred, started);
+        }
+    }
     if (getenv("DS4_CUDA_V41_EXPERT_WINDOW_PROFILE"))
         fprintf(stderr,
                 "ds4: V4.1 MMQ expert windows layer=%u rows=%u unique=%u windows=%u target=%u ok=%d\n",
@@ -40355,8 +40440,8 @@ static bool ds41_routed_moe_batch_windows(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
-                           const ds4_layer_weights *l, uint32_t il, uint32_t count,
-                           bool shared_owner) {
+                           const ds4_weights *w, const ds4_layer_weights *l,
+                           uint32_t il, uint32_t count, bool shared_owner) {
     CED_RANGE("moe_batch layer=%u pos=%u rows=%u", il, g->pos, count);
     ds41_prefill_row *b = &g->batch;
     if (!(ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
@@ -40371,7 +40456,14 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         return false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (g->streaming && count > DS4_TP_BATCH_MAX_ROWS) {
-        if (getenv("DS4_CUDA_V41_ROUTE_PROFILE")) {
+        const char *route_trace_path = getenv("DS4_CUDA_V41_ROUTE_TRACE");
+        const char *router_trace_path = getenv("DS4_CUDA_V41_ROUTER_TRACE");
+        const char *gate_input_trace_path = getenv("DS4_CUDA_V41_GATE_INPUT_TRACE");
+        const bool route_profile = getenv("DS4_CUDA_V41_ROUTE_PROFILE") != NULL;
+        const bool route_trace = route_trace_path && route_trace_path[0];
+        const bool router_trace = router_trace_path && router_trace_path[0];
+        const bool gate_input_trace = gate_input_trace_path && gate_input_trace_path[0];
+        if (route_profile || route_trace || router_trace || gate_input_trace) {
             const uint64_t slots = (uint64_t)count * DS4_N_EXPERT_USED;
             int32_t *ids = malloc((size_t)slots * sizeof(*ids));
             if (!ids) return false;
@@ -40387,16 +40479,88 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                         unique++;
                     }
                 }
-                fprintf(stderr,
-                    "ds4: V4.1 route profile layer=%u rows=%u slots=%llu unique=%u\n",
-                    il, count, (unsigned long long)slots, unique);
+                if (route_profile) {
+                    fprintf(stderr,
+                        "ds4: V4.1 route profile layer=%u rows=%u slots=%llu unique=%u\n",
+                        il, count, (unsigned long long)slots, unique);
+                }
+                if (gate_input_trace) {
+                    const uint64_t n_values = (uint64_t)count * DS4_N_EMBD;
+                    float *gate_input = malloc((size_t)n_values * sizeof(*gate_input));
+                    if (!gate_input || !ds4_gpu_tensor_read(b->norm, 0, gate_input,
+                                                             n_values * sizeof(*gate_input))) {
+                        free(gate_input);
+                        free(ids);
+                        return false;
+                    }
+                    FILE *gfp = fopen(gate_input_trace_path, "ab");
+                    if (!gfp) {
+                        fprintf(stderr, "ds4: cannot open V4.1 gate-input trace %s: %s\n",
+                                gate_input_trace_path, strerror(errno));
+                        free(gate_input);
+                        free(ids);
+                        return false;
+                    }
+                    const uint32_t hdr[3] = { il, count, DS4_N_EMBD };
+                    const bool write_ok = fwrite(hdr, sizeof(hdr), 1, gfp) == 1 &&
+                        fwrite(gate_input, sizeof(*gate_input), (size_t)n_values, gfp) == n_values;
+                    fclose(gfp);
+                    free(gate_input);
+                    if (!write_ok) {
+                        free(ids);
+                        return false;
+                    }
+                }
+                if (router_trace) {
+                    const uint64_t n_logits = (uint64_t)count * DS4_N_EXPERT;
+                    float *logits = malloc((size_t)n_logits * sizeof(*logits));
+                    if (!logits || !ds4_gpu_tensor_read(b->route_logits, 0, logits,
+                                                         n_logits * sizeof(*logits))) {
+                        free(logits);
+                        free(ids);
+                        return false;
+                    }
+                    FILE *rfp = fopen(router_trace_path, "ab");
+                    if (!rfp) {
+                        fprintf(stderr, "ds4: cannot open V4.1 router trace %s: %s\n",
+                                router_trace_path, strerror(errno));
+                        free(logits);
+                        free(ids);
+                        return false;
+                    }
+                    const uint32_t hdr[2] = { il, count };
+                    const bool write_ok = fwrite(hdr, sizeof(hdr), 1, rfp) == 1 &&
+                        fwrite(logits, sizeof(*logits), (size_t)n_logits, rfp) == n_logits;
+                    fclose(rfp);
+                    free(logits);
+                    if (!write_ok) {
+                        free(ids);
+                        return false;
+                    }
+                }
+                if (route_trace) {
+                    FILE *fp = fopen(route_trace_path, "a");
+                    if (!fp) {
+                        fprintf(stderr, "ds4: cannot open V4.1 route trace %s: %s\n",
+                                route_trace_path, strerror(errno));
+                        free(ids);
+                        return false;
+                    }
+                    for (uint32_t row = 0; row < count; row++) {
+                        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+                            const int32_t id = ids[(uint64_t)row * DS4_N_EXPERT_USED + slot];
+                            fprintf(fp, "%u,%u,%u,%d\n", il, row, slot, id);
+                        }
+                    }
+                    fclose(fp);
+                }
             }
             free(ids);
             if (!read) return false;
         }
         if (getenv("DS4_CUDA_V41_EXPERT_WINDOWS") &&
             count % DS4_TP_BATCH_MAX_ROWS != 1u) {
-            if (!ds41_routed_moe_batch_windows(g, m, l, il, b, count)) return false;
+            if (!ds41_routed_moe_batch_windows(g, m, w, l, il, b, count)) return false;
         } else {
             for (uint32_t off = 0; off < count; off += DS4_TP_BATCH_MAX_ROWS) {
                 const uint32_t rows = count - off < DS4_TP_BATCH_MAX_ROWS ?
@@ -41070,7 +41234,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             if (ok && batch_moe) {
-ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
+ok = ds41_moe_batch(g, m, w, &w->layer[il], il, count, false);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
@@ -41234,7 +41398,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
+            ds41_moe_batch(g, model, weights, l, il, rows, shared_owner) &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&

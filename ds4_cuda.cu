@@ -225,6 +225,7 @@ typedef struct {
 static cuda_stream_expert_persistent_cache g_stream_expert_persistent_cache;
 
 static void cuda_stream_persistent_cache_release(void);
+static void cuda_v41_route_prefetch_release(void);
 
 static int cuda_stream_selected_cache_uses_persistent_weights(void) {
     const cuda_stream_expert_persistent_cache *cache =
@@ -498,6 +499,7 @@ static void cuda_stream_selected_cache_release(void) {
                 (unsigned long long)g_stream_selected_upload_ranges,
                 (double)g_stream_selected_upload_bytes / 1073741824.0);
     }
+    cuda_v41_route_prefetch_release();
     cuda_expert_host_chunk_release();
     cuda_stream_persistent_cache_release();
     if (g_stream_selected_cache.gate_ptr) {
@@ -875,6 +877,28 @@ static uint64_t g_stream_expert_pack_down_bytes;
 static uint64_t g_stream_expert_pack_header_bytes;
 static uint32_t g_stream_expert_pack_layers;
 static uint32_t g_stream_expert_pack_experts;
+
+struct cuda_v41_route_prefetch_slot {
+    uint32_t layer = UINT32_MAX;
+    int32_t expert = -1;
+    uint8_t state = 0; /* 0 empty, 1 loading, 2 valid */
+};
+static void *g_v41_route_prefetch_arena;
+static uint32_t g_v41_route_prefetch_capacity;
+static uint64_t g_v41_route_prefetch_bytes;
+static std::vector<cuda_v41_route_prefetch_slot> g_v41_route_prefetch_slots;
+static pthread_mutex_t g_v41_route_prefetch_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_v41_route_prefetch_hits;
+static uint64_t g_v41_route_prefetch_misses;
+static uint64_t g_v41_route_prefetch_fills;
+static uint64_t g_v41_route_prefetch_evictions;
+static std::thread g_v41_frame_prefetch_thread;
+static std::atomic<int> g_v41_frame_prefetch_done(1);
+static uint64_t g_v41_frame_prefetch_generation;
+static uint64_t g_v41_frame_prefetch_starts;
+static uint64_t g_v41_frame_prefetch_skips;
+static uint64_t g_v41_frame_prefetch_reads;
+static uint64_t g_v41_frame_prefetch_failures;
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
@@ -3279,6 +3303,181 @@ static int cuda_stream_selected_load_expert_pack(
     return failed.load(std::memory_order_relaxed) ? 0 : 1;
 }
 
+static int cuda_v41_route_prefetch_cache_init(void) {
+    if (g_v41_route_prefetch_arena) return 1;
+    const char *env = getenv("DS4_CUDA_V41_ROUTE_PREFETCH_BUDGET");
+    unsigned long budget = 16u;
+    if (env && env[0]) {
+        char *end = NULL; errno = 0;
+        const unsigned long v = strtoul(env, &end, 10);
+        if (errno == 0 && end != env && *end == '\0' && v >= 1u && v <= 64u) budget = v;
+    }
+    if (!g_stream_expert_pack_record_bytes) return 0;
+    const uint64_t capacity = (uint64_t)budget * 2u;
+    const uint64_t bytes = capacity * g_stream_expert_pack_record_bytes;
+    if (capacity > UINT32_MAX || bytes > SIZE_MAX) return 0;
+    void *arena = NULL;
+    const cudaError_t err = cudaMallocHost(&arena, (size_t)bytes);
+    if (err != cudaSuccess || !arena) {
+        fprintf(stderr, "ds4: V4.1 rolling route-prefetch cache %.2f MiB failed: %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError(); return 0;
+    }
+    try { g_v41_route_prefetch_slots.assign((size_t)capacity, cuda_v41_route_prefetch_slot{}); }
+    catch (...) { (void)cudaFreeHost(arena); return 0; }
+    g_v41_route_prefetch_arena = arena;
+    g_v41_route_prefetch_capacity = (uint32_t)capacity;
+    g_v41_route_prefetch_bytes = bytes;
+    fprintf(stderr, "ds4: V4.1 rolling route-prefetch cache %.2f MiB (%u slots)\n",
+            (double)bytes / 1048576.0, g_v41_route_prefetch_capacity);
+    return 1;
+}
+
+static char *cuda_v41_route_prefetch_acquire(uint32_t layer, int32_t expert,
+                                              int allow_fill, int *need_read,
+                                              size_t *slot_out) {
+    if (need_read) *need_read = 0;
+    if (slot_out) *slot_out = SIZE_MAX;
+    if (!g_v41_route_prefetch_arena || expert < 0 ||
+        (uint32_t)expert >= g_stream_expert_pack_experts) return NULL;
+    pthread_mutex_lock(&g_v41_route_prefetch_mu);
+    for (uint32_t i = 0; i < g_v41_route_prefetch_capacity; i++) {
+        auto &slot = g_v41_route_prefetch_slots[i];
+        if (slot.layer == layer && slot.expert == expert) {
+            if (slot.state == 2) {
+                g_v41_route_prefetch_hits++;
+                char *ptr = (char *)g_v41_route_prefetch_arena +
+                    (uint64_t)i * g_stream_expert_pack_record_bytes;
+                pthread_mutex_unlock(&g_v41_route_prefetch_mu);
+                return ptr;
+            }
+            g_v41_route_prefetch_misses++;
+            pthread_mutex_unlock(&g_v41_route_prefetch_mu);
+            return NULL;
+        }
+    }
+    g_v41_route_prefetch_misses++;
+    if (!allow_fill) { pthread_mutex_unlock(&g_v41_route_prefetch_mu); return NULL; }
+    size_t victim = SIZE_MAX;
+    uint32_t oldest = UINT32_MAX;
+    for (uint32_t i = 0; i < g_v41_route_prefetch_capacity; i++) {
+        auto &slot = g_v41_route_prefetch_slots[i];
+        if (slot.state == 0) { victim = i; break; }
+        if (slot.state == 2 && slot.layer < oldest) { oldest = slot.layer; victim = i; }
+    }
+    if (victim == SIZE_MAX) { pthread_mutex_unlock(&g_v41_route_prefetch_mu); return NULL; }
+    auto &slot = g_v41_route_prefetch_slots[victim];
+    if (slot.state == 2) g_v41_route_prefetch_evictions++;
+    slot.layer = layer; slot.expert = expert; slot.state = 1;
+    g_v41_route_prefetch_fills++;
+    char *ptr = (char *)g_v41_route_prefetch_arena +
+        (uint64_t)victim * g_stream_expert_pack_record_bytes;
+    if (need_read) *need_read = 1;
+    if (slot_out) *slot_out = victim;
+    pthread_mutex_unlock(&g_v41_route_prefetch_mu);
+    return ptr;
+}
+
+static void cuda_v41_route_prefetch_commit(size_t slot_index, int ok) {
+    if (slot_index == SIZE_MAX || slot_index >= g_v41_route_prefetch_slots.size()) return;
+    pthread_mutex_lock(&g_v41_route_prefetch_mu);
+    auto &slot = g_v41_route_prefetch_slots[slot_index];
+    if (slot.state == 1) {
+        if (ok) slot.state = 2;
+        else { slot.state = 0; slot.layer = UINT32_MAX; slot.expert = -1; }
+    }
+    pthread_mutex_unlock(&g_v41_route_prefetch_mu);
+}
+
+static int cuda_v41_frame_prefetch_read(
+        const ds4_gpu_stream_expert_table table,
+        const std::vector<int32_t> ids,
+        uint64_t generation) {
+    (void)generation;
+    for (int32_t expert : ids) {
+        int need_read = 0;
+        size_t slot = SIZE_MAX;
+        char *dst = cuda_v41_route_prefetch_acquire(
+            table.layer, expert, 1, &need_read, &slot);
+        if (!dst || !need_read) continue;
+        const uint64_t rec_index = (uint64_t)table.layer *
+            g_stream_expert_pack_experts + (uint32_t)expert;
+        const uint64_t off = g_stream_expert_pack_header_bytes +
+            rec_index * g_stream_expert_pack_record_bytes;
+        const int ok = cuda_pread_full(g_stream_expert_pack_fd, dst,
+            g_stream_expert_pack_record_bytes, off);
+        cuda_v41_route_prefetch_commit(slot, ok);
+        if (!ok) return 0;
+        g_v41_frame_prefetch_reads++;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_v41_expert_frame_prefetch_start(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *expert_ids,
+        uint32_t n_experts) {
+    if (!getenv("DS4_CUDA_V41_ROUTE_PREFETCH") || !table || !expert_ids || !n_experts)
+        return 1;
+    if (!cuda_stream_expert_pack_open(table) || !cuda_v41_route_prefetch_cache_init()) return 0;
+    if (g_v41_frame_prefetch_thread.joinable()) {
+        if (!g_v41_frame_prefetch_done.load(std::memory_order_acquire)) {
+            g_v41_frame_prefetch_skips++;
+            return 1;
+        }
+        g_v41_frame_prefetch_thread.join();
+    }
+    std::vector<int32_t> ids;
+    try { ids.assign(expert_ids, expert_ids + n_experts); }
+    catch (...) { return 0; }
+    const ds4_gpu_stream_expert_table copy = *table;
+    const uint64_t generation = ++g_v41_frame_prefetch_generation;
+    g_v41_frame_prefetch_done.store(0, std::memory_order_release);
+    g_v41_frame_prefetch_starts++;
+    try {
+        g_v41_frame_prefetch_thread = std::thread([copy, ids, generation]() {
+            if (!cuda_v41_frame_prefetch_read(copy, ids, generation))
+                g_v41_frame_prefetch_failures++;
+            g_v41_frame_prefetch_done.store(1, std::memory_order_release);
+        });
+    } catch (...) {
+        g_v41_frame_prefetch_done.store(1, std::memory_order_release);
+        g_v41_frame_prefetch_failures++;
+        return 0;
+    }
+    return 1;
+}
+
+static void cuda_v41_route_prefetch_release(void) {
+    if (g_v41_frame_prefetch_thread.joinable()) {
+        g_v41_frame_prefetch_thread.join();
+        g_v41_frame_prefetch_done.store(1, std::memory_order_release);
+    }
+    if (g_v41_route_prefetch_arena) {
+        fprintf(stderr,
+                "ds4: V4.1 rolling route-prefetch summary: resident=%.2f MiB hits=%llu misses=%llu saved=%.2f GiB fills=%llu evictions=%llu starts=%llu skips=%llu reads=%llu failures=%llu\n",
+                (double)g_v41_route_prefetch_bytes / 1048576.0,
+                (unsigned long long)g_v41_route_prefetch_hits,
+                (unsigned long long)g_v41_route_prefetch_misses,
+                (double)(g_v41_route_prefetch_hits * g_stream_expert_pack_record_bytes) / 1073741824.0,
+                (unsigned long long)g_v41_route_prefetch_fills,
+                (unsigned long long)g_v41_route_prefetch_evictions,
+                (unsigned long long)g_v41_frame_prefetch_starts,
+                (unsigned long long)g_v41_frame_prefetch_skips,
+                (unsigned long long)g_v41_frame_prefetch_reads,
+                (unsigned long long)g_v41_frame_prefetch_failures);
+        (void)cudaFreeHost(g_v41_route_prefetch_arena);
+    }
+    g_v41_route_prefetch_arena = NULL;
+    g_v41_route_prefetch_capacity = 0;
+    g_v41_route_prefetch_bytes = 0;
+    g_v41_route_prefetch_slots.clear();
+    g_v41_route_prefetch_hits = g_v41_route_prefetch_misses = 0;
+    g_v41_route_prefetch_fills = g_v41_route_prefetch_evictions = 0;
+    g_v41_frame_prefetch_generation = g_v41_frame_prefetch_starts = 0;
+    g_v41_frame_prefetch_skips = g_v41_frame_prefetch_reads = g_v41_frame_prefetch_failures = 0;
+}
+
 static int cuda_stream_selected_load_expert_pack_direct(
         const ds4_gpu_stream_expert_table *table,
         const std::vector<int32_t> &compact_ids,
@@ -3292,6 +3491,8 @@ static int cuda_stream_selected_load_expert_pack_direct(
     const uint64_t total = count * g_stream_expert_pack_record_bytes;
     if (!cuda_stream_selected_packed_host_ensure(total)) return 0;
     char *frames = (char *)g_stream_selected_packed_host;
+    std::vector<const char *> frame_ptrs;
+    try { frame_ptrs.resize((size_t)count, NULL); } catch (...) { return 0; }
     if (workers < 1u) workers = 1u;
     if (workers > 8u) workers = 8u;
     if (workers > compact_ids.size()) workers = (uint32_t)compact_ids.size();
@@ -3306,6 +3507,12 @@ static int cuda_stream_selected_load_expert_pack_direct(
                 failed.store(1, std::memory_order_relaxed); break;
             }
             char *frame = frames + (uint64_t)i * g_stream_expert_pack_record_bytes;
+            char *prefetched = cuda_v41_route_prefetch_acquire(
+                table->layer, expert, 0, NULL, NULL);
+            if (prefetched) {
+                frame_ptrs[i] = prefetched;
+                continue;
+            }
             if (((uintptr_t)frame & 4095u) != 0u) {
                 failed.store(1, std::memory_order_relaxed); break;
             }
@@ -3313,10 +3520,12 @@ static int cuda_stream_selected_load_expert_pack_direct(
                 g_stream_expert_pack_experts + (uint32_t)expert;
             const uint64_t off = g_stream_expert_pack_header_bytes +
                 rec_index * g_stream_expert_pack_record_bytes;
-            if (!cuda_pread_full(g_stream_expert_pack_fd, frame,
-                                 g_stream_expert_pack_record_bytes, off)) {
+            const int read_ok = cuda_pread_full(g_stream_expert_pack_fd, frame,
+                                                g_stream_expert_pack_record_bytes, off);
+            if (!read_ok) {
                 failed.store(1, std::memory_order_relaxed); break;
             }
+            frame_ptrs[i] = frame;
         }
     };
     std::vector<std::thread> pool;
@@ -3327,7 +3536,8 @@ static int cuda_stream_selected_load_expert_pack_direct(
     for (std::thread &t : pool) if (t.joinable()) t.join();
     if (failed.load(std::memory_order_relaxed)) return 0;
     for (uint64_t i = 0; i < count; i++) {
-        const char *frame = frames + i * g_stream_expert_pack_record_bytes;
+        const char *frame = frame_ptrs[i] ? frame_ptrs[i] :
+            frames + i * g_stream_expert_pack_record_bytes;
         cudaError_t err = cudaMemcpyAsync(
             gate_dst + i * table->gate_expert_bytes,
             frame, (size_t)table->gate_expert_bytes,

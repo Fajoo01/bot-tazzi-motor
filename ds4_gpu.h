@@ -393,6 +393,10 @@ int ds4_gpu_stream_expert_cache_begin_selected_masked_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+int ds4_gpu_v41_expert_frame_prefetch_start(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        uint32_t                           n_experts);
 int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
