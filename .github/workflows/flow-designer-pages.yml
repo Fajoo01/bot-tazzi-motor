@@ -1,0 +1,52 @@
+name: Flow Designer Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools/flow-designer/**"
+      - ".github/workflows/flow-designer-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "flow-designer-pages"
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tools/flow-designer/package-lock.json
+      - name: Install
+        working-directory: tools/flow-designer
+        run: npm ci
+      - name: Test
+        working-directory: tools/flow-designer
+        run: npm test
+      - name: Build
+        working-directory: tools/flow-designer
+        run: npm run build
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: tools/flow-designer/dist
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
