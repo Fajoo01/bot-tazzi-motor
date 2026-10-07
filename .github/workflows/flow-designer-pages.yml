@@ -1,11 +1,6 @@
 name: Flow Designer Pages
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "tools/flow-designer/**"
-      - ".github/workflows/flow-designer-pages.yml"
   workflow_dispatch:
 
 permissions:
